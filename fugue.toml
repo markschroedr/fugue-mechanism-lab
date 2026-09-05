@@ -1,0 +1,78 @@
+[storage]
+data_dir = "data"
+
+[api]
+host = "127.0.0.1"
+port = 49321
+
+[ui]
+host = "127.0.0.1"
+port = 49322
+preview_port = 49323
+
+[llm]
+model = "openai/gpt-5.6-luna"
+effort = "medium"
+request_timeout_seconds = 600
+
+# Stage-specific overrides; valid keys are the agents printed by `./fugue context`.
+# Harvest runs at high effort: measured 2026-07-21, luna/high recovered the
+# subthreads luna/medium missed (10 vs 7 stances) while xhigh regressed to 8.
+[llm.agents.lesswrong_landscape]
+effort = "high"
+
+[sources.forum_magnum]
+endpoint = "https://www.lesswrong.com/graphql"
+
+[society]
+instance_id = "default"
+mission = "You are here. Choose what to do. Stay active."
+treasury_address = "treasury"
+weekly_allowance = 100
+compute_backing = "obols"
+shared_daily_line = ""
+# Replace this RFC1918 placeholder with the VM bridge address for your deployment.
+guest_api_url = "http://10.0.0.1:49321"
+kit_dir = "data/kits"
+# Replace this placeholder with the absolute path to your sandbox launcher.
+sandbox_bin = "/path/to/microvm-sandbox/sandbox"
+
+[society.runner]
+executor_binary = "pi"
+default_model = "luna"
+default_effort = "high"
+default_sleep_seconds = 300
+max_sleep_seconds = 300
+active_hours_timezone = "Europe/Vienna"
+active_hours_start = 8
+active_hours_end = 22
+wall_timeout_seconds = 86400
+poll_seconds = 0.2
+quota_threshold_percent = 85
+quota_pause_seconds = 600
+quota_probe = true
+wake_gate_path = "data/wake-gate.sqlite"
+max_active_wakes = 3
+wake_lease_seconds = 180
+
+[society.models.luna]
+model = "openai-codex/gpt-5.6-luna"
+# pi's bundled cost metadata currently overprices Luna 5x for this account.
+inputUsdPerMillion = 0.2
+cachedInputUsdPerMillion = 0.02
+cacheWriteInputUsdPerMillion = 0.25
+outputUsdPerMillion = 1.2
+
+[society.models.terra]
+model = "openai-codex/gpt-5.6-terra"
+inputUsdPerMillion = 2.5
+cachedInputUsdPerMillion = 0.25
+cacheWriteInputUsdPerMillion = 3.125
+outputUsdPerMillion = 15.0
+
+[society.models.sol]
+model = "openai-codex/gpt-5.6-sol"
+inputUsdPerMillion = 5.0
+cachedInputUsdPerMillion = 0.5
+cacheWriteInputUsdPerMillion = 6.25
+outputUsdPerMillion = 30.0

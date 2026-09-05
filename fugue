@@ -1,0 +1,403 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT="${0:A:h}"
+cd "$ROOT"
+CONFIG_PATH="${FUGUE_CONFIG:-$ROOT/fugue.toml}"
+
+usage() {
+  cat <<'EOF'
+Usage: ./fugue <command> [args...]
+
+Commands:
+  status        Show repo and configured runtime paths.
+  config        Print fugue.toml.
+  context       Print declared LLM agent context definitions.
+  init          Initialize empty local databases.
+  api           Start the Rust API.
+  lab-api       Start the loopback-only multi-society observer API.
+  hosted-ui     Start the built hosted UI.
+  ui            Start the Svelte UI.
+  eval          Run the live Ngo-thread synthesis evaluation with a cost report.
+  eval-synthesis Alias for eval.
+  eval-newspaper [case...] Run the bounded live Newspaper prompt evaluation.
+  contracts     Generate TypeScript bindings from the Rust contract crate.
+  check         Run frontend and Rust checks.
+  build         Build the hosted SvelteKit frontend and check the Rust workspace.
+  build-desktop Build the desktop static SvelteKit SPA for the future Tauri shell.
+  preview       Preview the hosted SvelteKit build.
+  society-birth <name>  Create an agent and write its self-contained Robinson kit.
+  society-allowance     Mint this week's configured allowance once per living agent.
+  society-keeper <agent> [vm] Keep one agent's VM resident loop alive (relaunch with backoff).
+  society-services <core|prepare|install|start|stop|uninstall|status|verify-stopped>  Manage one configured society instance.
+  lab-services <start|stop|status>  Manage the host Lab API, built UI, and loopback gateway.
+  experiment <create|copy|configure-compute|prepare|birth|start|stop|recover|status|rebind|society>  Manage portable society experiments.
+  society <subcommand>  Administration: status, feed, show, ledger, receipts, transcript, tell, wake, home.
+  cargo ...     Run cargo with remaining args.
+  bun ...       Run bun with remaining args.
+EOF
+}
+
+write_service_plist() {
+  local plist_path="$1" label="$2" command="$3" log="$4"
+  python3 - "$plist_path" "$label" "$command" "$log" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+path, label, command, log = sys.argv[1:]
+with pathlib.Path(path).open("wb") as destination:
+    plistlib.dump({
+        "Label": label,
+        "ProgramArguments": ["/bin/zsh", "-lc", command],
+        "KeepAlive": True,
+        "RunAtLoad": True,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }, destination)
+PY
+}
+
+reload_service_plist() {
+  local label="$1" plist="$2"
+  unload_service_label "$label"
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+}
+
+unload_service_label() {
+  local label="$1"
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  for attempt in {1..50}; do
+    launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || return 0
+    sleep 0.1
+    (( attempt < 50 )) || { print -u2 "service did not unload: $label"; return 1; }
+  done
+}
+
+case "${1:-}" in
+  status)
+    printf 'repo=%s\n' "$ROOT"
+    printf 'config=%s\n' "$CONFIG_PATH"
+    git status --short
+    ;;
+  config)
+    sed -n '1,220p' "$CONFIG_PATH"
+    ;;
+  context)
+    cargo run -q -p fugue-server -- context
+    ;;
+  init)
+    cargo run -p fugue-server -- init
+    ;;
+  api)
+    if [[ -n "${FUGUE_SERVER_BIN:-}" ]]; then
+      exec "$FUGUE_SERVER_BIN"
+    fi
+    exec cargo run -p fugue-server
+    ;;
+  lab-api)
+    exec cargo run -q -p fugue-lab
+    ;;
+  hosted-ui)
+    [[ -f "$ROOT/frontend/build/index.js" ]] || {
+      print -u2 'hosted UI is not built; run ./fugue build first'
+      exit 1
+    }
+    UI_HOST_VALUE="${FUGUE_UI_HOST:-127.0.0.1}"
+    UI_PORT_VALUE="${FUGUE_PREVIEW_PORT:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["ui"]["preview_port"])' "$CONFIG_PATH")}"
+    exec env HOST="$UI_HOST_VALUE" PORT="$UI_PORT_VALUE" node frontend/build
+    ;;
+  ui)
+    exec bun run dev
+    ;;
+  eval|eval-synthesis)
+    FUGUE_LIVE_LESSWRONG=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/eval_synthesis_principles.ts
+    ;;
+  eval-newspaper)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/eval_newspaper_prompt.ts "$@"
+    ;;
+  contracts)
+    cargo run -p fugue-contract --bin export-types
+    ;;
+  check)
+    cargo run -p fugue-contract --bin export-types -- --check
+    bun run check
+    cargo check --workspace
+    ;;
+  build)
+    FUGUE_BUILD_TARGET=hosted bun run build
+    cargo check --workspace
+    ;;
+  build-desktop)
+    FUGUE_BUILD_TARGET=desktop bun run build
+    ;;
+  preview)
+    exec env FUGUE_BUILD_TARGET=hosted bun run preview
+    ;;
+  society-birth)
+    shift
+    exec python3 scripts/society_birth.py "$@"
+    ;;
+  society-allowance)
+    if [[ -z "${FUGUE_SUBSTRATE_KEY:-}" ]]; then
+      print -u2 'FUGUE_SUBSTRATE_KEY is required'
+      exit 1
+    fi
+    API_HOST="${FUGUE_API_HOST:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["api"]["host"])' "$CONFIG_PATH")}"
+    API_PORT="${FUGUE_API_PORT:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["api"]["port"])' "$CONFIG_PATH")}"
+    [[ "$API_HOST" == "0.0.0.0" ]] && API_HOST="127.0.0.1"
+    exec curl -fsS -X POST -H "Authorization: Bearer $FUGUE_SUBSTRATE_KEY" "${FUGUE_API_URL:-http://$API_HOST:$API_PORT}/api/society/allowance"
+    ;;
+  experiment)
+    shift
+    exec python3 scripts/experiment.py "$@"
+    ;;
+  society)
+    shift
+    API_HOST="${FUGUE_API_HOST:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["api"]["host"])' "$CONFIG_PATH")}"
+    API_PORT="${FUGUE_API_PORT:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["api"]["port"])' "$CONFIG_PATH")}"
+    [[ "$API_HOST" == "0.0.0.0" ]] && API_HOST="127.0.0.1"
+    API_URL="${FUGUE_API_URL:-http://$API_HOST:$API_PORT}"
+    SANDBOX_BIN="${FUGUE_SANDBOX_BIN:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"].get("sandbox_bin",""))' "$CONFIG_PATH")}"
+    KITS_DIR="${FUGUE_KIT_DIR:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"].get("kit_dir","data/kits"))' "$CONFIG_PATH")}"
+    [[ "$KITS_DIR" != /* ]] && KITS_DIR="${CONFIG_PATH:h}/$KITS_DIR"
+    FUGUE_API_URL="$API_URL" FUGUE_SANDBOX_BIN="$SANDBOX_BIN" FUGUE_KIT_DIR="$KITS_DIR" exec python3 scripts/society_admin.py "$@"
+    ;;
+  society-keeper)
+    agent="${2:?agent name required}"
+    vm_name="${3:-$agent}"
+    SANDBOX_BIN="${FUGUE_SANDBOX_BIN:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"]["sandbox_bin"])' "$CONFIG_PATH")}"
+    GUEST_API_URL="$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"]["guest_api_url"])' "$CONFIG_PATH")"
+    if [[ ! -x "$SANDBOX_BIN" ]]; then
+      print -u2 "society-keeper: sandbox binary not executable: $SANDBOX_BIN"
+      exit 1
+    fi
+    while true; do
+      started=$(date +%s)
+      (cd "${SANDBOX_BIN:h}" && "$SANDBOX_BIN" run "$vm_name" -- env "FUGUE_API_URL=$GUEST_API_URL" bash -lc 'exec /home/coder/society/runner.py --kit /home/coder/society --home /home/coder') || true
+      elapsed=$(( $(date +%s) - started ))
+      # A run that dies within two minutes is a halt (no balance, bad quota) or a
+      # crash loop; back off long so relaunching is sleep, not hammering.
+      if (( elapsed < 120 )); then sleep 1800; else sleep 30; fi
+    done
+    ;;
+  society-services)
+    action="${2:?core|prepare|install|start|stop|uninstall|status|verify-stopped required}"
+    INSTANCE_ID="$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c.get("society",{}).get("instance_id","default"))' "$CONFIG_PATH")"
+    LABEL_PREFIX="com.fugue.society"
+    [[ "$INSTANCE_ID" != "default" ]] && LABEL_PREFIX="$LABEL_PREFIX.$INSTANCE_ID"
+    AGENTS_DIR="$HOME/Library/LaunchAgents"
+    INSTANCE_HOME="$HOME/.fugue"
+    [[ "$INSTANCE_ID" != "default" ]] && INSTANCE_HOME="$INSTANCE_HOME/societies/$INSTANCE_ID"
+    LOG_DIR="${FUGUE_SERVICE_LOG_DIR:-$INSTANCE_HOME/logs}"
+    DATA_DIR="${FUGUE_DATA_DIR:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["storage"].get("data_dir","data"))' "$CONFIG_PATH")}"
+    [[ "$DATA_DIR" != /* ]] && DATA_DIR="${CONFIG_PATH:h}/$DATA_DIR"
+    SUBSTRATE_KEY_FILE="${FUGUE_SUBSTRATE_KEY_FILE:-$INSTANCE_HOME/substrate.key}"
+    KITS_DIR="${FUGUE_KIT_DIR:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"].get("kit_dir","data/kits"))' "$CONFIG_PATH")}"
+    [[ "$KITS_DIR" != /* ]] && KITS_DIR="${CONFIG_PATH:h}/$KITS_DIR"
+    SANDBOX_BIN="${FUGUE_SANDBOX_BIN:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"].get("sandbox_bin",""))' "$CONFIG_PATH")}"
+    SERVER_BIN="${FUGUE_SERVER_BIN:-}"
+    loaded_society_service_labels() {
+      local selection="$1" pid exit_status label listing keeper_prefix="$LABEL_PREFIX.keeper-"
+      listing="$(launchctl list)" || return 1
+      print -r -- "$listing" | while read -r pid exit_status label; do
+        [[ -n "$label" ]] || continue
+        if [[ "$selection" == "keepers" ]]; then
+          [[ "$label" == "$keeper_prefix"* ]] || continue
+        elif [[ "$INSTANCE_ID" == "default" ]]; then
+          [[ "$label" == "$LABEL_PREFIX.api" || "$label" == "$keeper_prefix"* ]] || continue
+        else
+          [[ "$label" == "$LABEL_PREFIX."* ]] || continue
+        fi
+        print -r -- "$label"
+      done | LC_ALL=C sort -u
+    }
+    keeper_service_plists() {
+      local plist
+      for plist in "$AGENTS_DIR/$LABEL_PREFIX".keeper-*.plist(N); do
+        print -r -- "$plist"
+      done
+    }
+    all_society_service_plists() {
+      local plist
+      if [[ "$INSTANCE_ID" == "default" ]]; then
+        [[ -f "$AGENTS_DIR/$LABEL_PREFIX.api.plist" ]] && print -r -- "$AGENTS_DIR/$LABEL_PREFIX.api.plist"
+        keeper_service_plists
+      else
+        for plist in "$AGENTS_DIR/$LABEL_PREFIX".*.plist(N); do
+          print -r -- "$plist"
+        done
+      fi
+    }
+    report_loaded_society_services() {
+      local found=0 label labels
+      labels="$(loaded_society_service_labels all)" || return 2
+      while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        print "service=$label"
+        found=1
+      done <<< "$labels"
+      (( found )) && return 0
+      print "services=none"
+      return 1
+    }
+    install_keepers() {
+      [[ -x "$SANDBOX_BIN" ]] || { print -u2 "sandbox binary not executable: $SANDBOX_BIN"; exit 1; }
+      for kit in "$KITS_DIR"/*(N/); do
+        agent="${kit:t}"
+        vm_name="$agent"
+        [[ "$INSTANCE_ID" != "default" ]] && vm_name="$INSTANCE_ID-$agent"
+        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.keeper-$agent.plist" "$LABEL_PREFIX.keeper-$agent" \
+          "cd '$ROOT' && FUGUE_CONFIG='$CONFIG_PATH' FUGUE_KIT_DIR='$KITS_DIR' FUGUE_SANDBOX_BIN='$SANDBOX_BIN' exec ./fugue society-keeper '$agent' '$vm_name'" \
+          "$LOG_DIR/keeper-$agent.log"
+        reload_service_plist "$LABEL_PREFIX.keeper-$agent" "$AGENTS_DIR/$LABEL_PREFIX.keeper-$agent.plist"
+        print "installed $LABEL_PREFIX.keeper-$agent"
+      done
+    }
+    case "$action" in
+      core|install|prepare)
+        mkdir -p "$LOG_DIR" "$AGENTS_DIR"
+        [[ -f "$SUBSTRATE_KEY_FILE" ]] || { print -u2 "missing substrate key: $SUBSTRATE_KEY_FILE"; exit 1; }
+        [[ -z "$SERVER_BIN" || -x "$SERVER_BIN" ]] || { print -u2 "server binary not executable: $SERVER_BIN"; exit 1; }
+        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.api.plist" "$LABEL_PREFIX.api" \
+          "cd '$ROOT' && FUGUE_CONFIG='$CONFIG_PATH' FUGUE_DATA_DIR='$DATA_DIR' FUGUE_SUBSTRATE_KEY=\$(cat '$SUBSTRATE_KEY_FILE') FUGUE_SERVER_BIN='$SERVER_BIN' exec ./fugue api" \
+          "$LOG_DIR/api.log"
+        reload_service_plist "$LABEL_PREFIX.api" "$AGENTS_DIR/$LABEL_PREFIX.api.plist"
+        print "installed $LABEL_PREFIX.api"
+        if [[ "$action" == "install" ]]; then
+          install_keepers
+        elif [[ "$action" == "prepare" ]]; then
+          for plist in "$AGENTS_DIR"/$LABEL_PREFIX.keeper-*.plist(N); do
+            launchctl bootout "gui/$(id -u)/${plist:t:r}" 2>/dev/null || true
+            rm -f "$plist"
+          done
+          print "prepared $INSTANCE_ID without keepers"
+        else
+          print "restarted $INSTANCE_ID core services without touching keepers"
+        fi
+        ;;
+      start)
+        mkdir -p "$LOG_DIR" "$AGENTS_DIR"
+        install_keepers
+        ;;
+      stop)
+        labels="$(loaded_society_service_labels keepers)" || exit 1
+        while IFS= read -r label; do
+          [[ -n "$label" ]] || continue
+          unload_service_label "$label"
+          print "stopped $label"
+        done <<< "$labels"
+        while IFS= read -r plist; do
+          [[ -n "$plist" ]] || continue
+          rm -f "$plist"
+        done < <(keeper_service_plists)
+        ;;
+      uninstall)
+        labels="$(loaded_society_service_labels all)" || exit 1
+        while IFS= read -r label; do
+          [[ -n "$label" ]] || continue
+          unload_service_label "$label"
+          print "removed $label"
+        done <<< "$labels"
+        while IFS= read -r plist; do
+          [[ -n "$plist" ]] || continue
+          rm -f "$plist"
+        done < <(all_society_service_plists)
+        ;;
+      status)
+        if report_loaded_society_services; then
+          true
+        else
+          result="$?"
+          (( result == 1 )) || exit "$result"
+        fi
+        ;;
+      verify-stopped)
+        if report_loaded_society_services; then
+          exit 1
+        else
+          result="$?"
+          (( result == 1 )) || exit "$result"
+        fi
+        ;;
+      *)
+        print -u2 "society-services: unknown action $action"
+        exit 2
+        ;;
+    esac
+    ;;
+  lab-services)
+    action="${2:-}"
+    if [[ "$action" == "-h" || "$action" == "--help" || "$action" == "help" ]]; then
+      print 'Usage: ./fugue lab-services <start|stop|status>'
+      exit 0
+    fi
+    [[ -n "$action" ]] || { print -u2 'lab-services: start|stop|status required'; exit 2; }
+    HOST_CONFIG="${FUGUE_HOST_CONFIG:-}"
+    [[ -n "$HOST_CONFIG" ]] || { print -u2 'lab-services requires FUGUE_HOST_CONFIG'; exit 1; }
+    [[ -f "$HOST_CONFIG" ]] || { print -u2 "host config missing: $HOST_CONFIG"; exit 1; }
+    HOST_CONFIG="${HOST_CONFIG:A}"
+    LABEL_PREFIX="com.fugue.lab"
+    AGENTS_DIR="$HOME/Library/LaunchAgents"
+    case "$action" in
+      start)
+        HOST_LOG_DIR="$(python3 -c 'import pathlib,sys,tomllib; f=pathlib.Path(sys.argv[1]); v=pathlib.Path(tomllib.load(f.open("rb")).get("logs_dir", "~/.fugue/logs")).expanduser(); print((v if v.is_absolute() else f.parent/v).resolve())' "$HOST_CONFIG")"
+        LOG_DIR="${FUGUE_SERVICE_LOG_DIR:-$HOST_LOG_DIR/lab}"
+        CADDY_BIN="${FUGUE_CADDY_BIN:-$(python3 -c 'import pathlib,sys,tomllib; f=pathlib.Path(sys.argv[1]); raw=tomllib.load(f.open("rb")).get("caddy_bin", ""); v=pathlib.Path(raw).expanduser(); print((v if v.is_absolute() else f.parent/v).resolve() if raw else "")' "$HOST_CONFIG")}"
+        CADDY_CONFIG="${FUGUE_CADDY_CONFIG:-$ROOT/deploy/society/Caddyfile}"
+        LAB_PORT="${FUGUE_LAB_PORT:-49320}"
+        UI_PORT="${FUGUE_PREVIEW_PORT:-49323}"
+        GATEWAY_PORT="${FUGUE_LAB_GATEWAY_PORT:-49324}"
+        DIRECT_API_UPSTREAM="${FUGUE_DIRECT_API_UPSTREAM:-127.0.0.1:49321}"
+        [[ -f "$ROOT/frontend/build/index.js" ]] || { print -u2 'hosted UI is not built; run ./fugue build first'; exit 1; }
+        [[ -x "$CADDY_BIN" ]] || { print -u2 "caddy binary not executable: $CADDY_BIN"; exit 1; }
+        [[ -f "$CADDY_CONFIG" ]] || { print -u2 "caddy config missing: $CADDY_CONFIG"; exit 1; }
+        mkdir -p "$LOG_DIR" "$AGENTS_DIR"
+        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.api.plist" "$LABEL_PREFIX.api" \
+          "cd '$ROOT' && FUGUE_HOST_CONFIG='$HOST_CONFIG' FUGUE_LAB_HOST=127.0.0.1 FUGUE_LAB_PORT='$LAB_PORT' exec ./fugue lab-api" \
+          "$LOG_DIR/api.log"
+        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.ui.plist" "$LABEL_PREFIX.ui" \
+          "cd '$ROOT' && FUGUE_UI_HOST=127.0.0.1 FUGUE_PREVIEW_PORT='$UI_PORT' exec ./fugue hosted-ui" \
+          "$LOG_DIR/ui.log"
+        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.gateway.plist" "$LABEL_PREFIX.gateway" \
+          "FUGUE_LAB_GATEWAY_PORT='$GATEWAY_PORT' FUGUE_LAB_UPSTREAM='127.0.0.1:$LAB_PORT' FUGUE_LAB_UI_UPSTREAM='127.0.0.1:$UI_PORT' FUGUE_DIRECT_API_UPSTREAM='$DIRECT_API_UPSTREAM' exec '$CADDY_BIN' run --config '$CADDY_CONFIG' --adapter caddyfile" \
+          "$LOG_DIR/gateway.log"
+        for service in api ui gateway; do
+          reload_service_plist "$LABEL_PREFIX.$service" "$AGENTS_DIR/$LABEL_PREFIX.$service.plist"
+          print "installed $LABEL_PREFIX.$service"
+        done
+        ;;
+      stop)
+        for service in api ui gateway; do
+          label="$LABEL_PREFIX.$service"
+          launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+          rm -f "$AGENTS_DIR/$label.plist"
+          print "stopped $label"
+        done
+        ;;
+      status)
+        launchctl list | grep -E "^[-0-9]+[[:space:]]+[-0-9]+[[:space:]]+$LABEL_PREFIX\\.(api|ui|gateway)$" || print "no $LABEL_PREFIX services loaded"
+        ;;
+      *)
+        print -u2 "lab-services: unknown action $action"
+        exit 2
+        ;;
+    esac
+    ;;
+  cargo)
+    shift
+    cargo "$@"
+    ;;
+  bun)
+    shift
+    bun "$@"
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    printf 'Unknown command: %s\n\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

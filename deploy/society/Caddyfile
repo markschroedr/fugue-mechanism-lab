@@ -1,0 +1,20 @@
+{
+	auto_https off
+	admin off
+}
+
+http://:{$FUGUE_LAB_GATEWAY_PORT:49324} {
+	bind 127.0.0.1
+
+	handle /api/lab/* {
+		reverse_proxy {$FUGUE_LAB_UPSTREAM:127.0.0.1:49320}
+	}
+
+	handle /api/* {
+		reverse_proxy {$FUGUE_DIRECT_API_UPSTREAM:127.0.0.1:49321}
+	}
+
+	handle {
+		reverse_proxy {$FUGUE_LAB_UI_UPSTREAM:127.0.0.1:49323}
+	}
+}

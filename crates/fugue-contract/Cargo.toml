@@ -1,0 +1,12 @@
+[package]
+name = "fugue-contract"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+fugue-store.workspace = true
+serde.workspace = true
+specta.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

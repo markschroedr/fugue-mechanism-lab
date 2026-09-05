@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/fugue-contract",
+    "crates/fugue-core",
+    "crates/fugue-lab",
+    "crates/fugue-store",
+    "crates/fugue-server",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+axum = "0.8"
+base64 = "0.22"
+flate2 = "1.1"
+fugue-core = { path = "crates/fugue-core" }
+fugue-contract = { path = "crates/fugue-contract" }
+fugue-store = { path = "crates/fugue-store" }
+rusqlite = "0.37"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+specta = { version = "=1.0.5", features = ["export"] }
+tar = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+toml = "0.9"

@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import fcntl
 import ipaddress
+import importlib.util
 import json
 import os
 import re
@@ -23,10 +24,15 @@ import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
+from urllib.error import URLError
 from urllib.parse import quote
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+if __package__:
+    from .worlds import definition as world_definition, refresh_kit, snapshot_world
+else:
+    from worlds import definition as world_definition, refresh_kit, snapshot_world
 
 ROOT = Path(__file__).resolve().parent.parent
 ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
@@ -85,9 +91,23 @@ class Host:
             "sandbox_bin",
             template.get("society", {}).get("sandbox_bin", ""),
         )
+        self.sandbox_env = {
+            env: value for env, key in (
+                ("SANDBOX_STATE_DIR", "sandbox_state_dir"),
+                ("SANDBOX_VOLUME_MOUNT", "volume_mount"),
+                ("FUGUE_HOST_FREE_RESERVE_BYTES", "host_free_reserve_bytes"),
+                ("FUGUE_HOST_FREE_PATH", "host_free_path"),
+                ("FUGUE_STATE_FREE_RESERVE_BYTES", "state_free_reserve_bytes"),
+            ) if (value := setting(env, key, ""))
+        }
+        mount = self.sandbox_env.get("SANDBOX_VOLUME_MOUNT")
+        if mount and os.stat(mount).st_dev == os.stat(Path(mount).parent).st_dev:
+            raise RuntimeError("required bounded experiment volume is not mounted")
+        self.cohort_hook = setting("FUGUE_COHORT_HOOK", "cohort_hook", ROOT / "scripts/observer/cohort.py")
+        self.codex_auth = setting("SANDBOX_CODEX_AUTH", "codex_auth_file", "")
         self.server = setting("FUGUE_SERVER_BIN", "server_bin", "")
         self.caddy = setting("FUGUE_CADDY_BIN", "caddy_bin", "")
-        self.vm_bridge_host = setting("FUGUE_VM_BRIDGE_HOST", "vm_bridge_host", "10.0.0.1")
+        self.vm_bridge_host = setting("FUGUE_VM_BRIDGE_HOST", "vm_bridge_host", "192.168.64.1")
 
     def package(self, experiment_id: str) -> Path:
         validate_id(experiment_id)
@@ -273,7 +293,8 @@ def used_ports(host: Host, exclude_id: str | None = None) -> set[int]:
         if path.parent.name == exclude_id:
             continue
         _, config = validate_package_boundary(host, path.parent.name)
-        ports.add(int(configured_binding(host, config, path.parent.name)["apiPort"]))
+        port = int(configured_binding(host, config, path.parent.name)["apiPort"])
+        ports.update((port, port + 1))
     return ports
 
 
@@ -542,15 +563,48 @@ def capture_observer(host: Host, experiment_id: str) -> Path:
     }
     path = host.package(experiment_id) / "evidence/observer.json"
     write_observer_snapshot(path, snapshot)
+    capture_world(host, experiment_id)
     print(f"observer={path}")
     return path
+
+
+def capture_world(host: Host, experiment_id: str) -> None:
+    package = host.package(experiment_id)
+    config = load_toml(package / "fugue.toml")
+    world = world_definition(ROOT, config["society"], package)
+    binding = ensure_binding(host, experiment_id)
+    key = host.secret(experiment_id).read_text(encoding="utf-8").strip()
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            evidence, _ = fetch_json(f"http://{binding['apiHost']}:{binding['apiPort']}/api/society/world-evidence", key, MAX_OBSERVER_BYTES)
+            break
+        except URLError as error:
+            if not isinstance(error.reason, ConnectionRefusedError) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+    active = next((run for run in evidence["runs"] if run["id"] == evidence["activeRunId"]), None)
+    if not active or active["manifest"]["world"]["id"] != world["id"]:
+        raise RuntimeError("prepared API world differs from config; stop and prepare again")
+    evidence["agentKits"] = {
+        agent: {
+            name: (package / "agents/kits" / agent / name).read_text(encoding="utf-8")
+            for name in ("SPAWN.md", "SKILL-society-node.md", "node.json", "rates.json", "onboarding.json")
+            if (package / "agents/kits" / agent / name).is_file()
+        } for agent in agent_names(package)
+    }
+    evidence["capturedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    # Each start keeps its own reviewed presentation; the latest export is also convenient.
+    stamp = time.time_ns()
+    write_observer_snapshot(package / f"evidence/world-{stamp}.json", evidence)
+    write_observer_snapshot(package / "evidence/world.json", evidence)
 
 
 def allocate_port(host: Host, exclude_id: str | None = None) -> int:
     occupied = used_ports(host, exclude_id)
     vm_bridge_host(host)
-    for candidate in range(49325, 65536):
-        if candidate not in occupied and bindable("127.0.0.1", candidate):
+    for candidate in range(49325, 65535):
+        if candidate not in occupied and candidate + 1 not in occupied and bindable("127.0.0.1", candidate) and bindable("127.0.0.1", candidate + 1):
             return candidate
     raise RuntimeError("no experiment API port is available")
 
@@ -647,21 +701,30 @@ def service_env(host: Host, experiment_id: str, require_secret: bool = True) -> 
         "FUGUE_API_HOST",
         "FUGUE_API_PORT",
         "FUGUE_API_URL",
+        "FUGUE_GUEST_BIND_PORT",
         "FUGUE_CADDY_BIN",
         "FUGUE_CADDY_CONFIG",
         "FUGUE_DATA_DIR",
         "FUGUE_KIT_DIR",
         "FUGUE_PREVIEW_PORT",
+        "FUGUE_ORACLE_KEY",
+        "FUGUE_ORACLE_KEY_FILE",
         "FUGUE_SUBSTRATE_KEY",
         "FUGUE_SUBSTRATE_KEY_FILE",
         "FUGUE_UI_HOST",
         "FUGUE_UI_PORT",
     ):
         env.pop(name, None)
+    env.update(host.sandbox_env)
     env.update(
+        FUGUE_GUEST_BIND_PORT=str(int(binding["apiPort"]) + 1),
+        FUGUE_COHORT_HOOK=str(host.cohort_hook),
+        SANDBOX_CODEX_AUTH=str(host.codex_auth),
         FUGUE_CONFIG=str(package / "fugue.toml"),
         FUGUE_API_URL=f"http://{binding['apiHost']}:{binding['apiPort']}",
         FUGUE_SERVICE_LOG_DIR=str(host.logs / experiment_id),
+        FUGUE_SERVICE_RUNTIME_DIR=str(host.logs / experiment_id / "runtime"),
+        FUGUE_ORACLE_KEY_FILE=str(host.secret(experiment_id).parent / "oracle.key"),
     )
     secret = host.secret(experiment_id)
     if require_secret:
@@ -840,7 +903,12 @@ def finish_materialization(package: Path, agent: str) -> None:
     sync_directory(marker.parent)
 
 
-def sandbox(host: Host, *arguments: str, capture: bool = False) -> str:
+def sandbox(host: Host, *arguments: str, capture: bool = False, package: Path | None = None) -> str:
+    if package is not None:
+        spec = importlib.util.spec_from_file_location("cohort_hook", host.cohort_hook)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.run_sandbox(host, package, arguments, capture)
     if not host.sandbox or not Path(host.sandbox).is_file():
         raise RuntimeError("host sandbox_bin is not configured")
     result = subprocess.run(
@@ -849,6 +917,7 @@ def sandbox(host: Host, *arguments: str, capture: bool = False) -> str:
         check=True,
         text=True,
         capture_output=capture,
+        env={**os.environ, **host.sandbox_env, **({"SANDBOX_CODEX_AUTH": host.codex_auth} if host.codex_auth else {})},
     )
     return result.stdout if capture else ""
 
@@ -863,21 +932,25 @@ def materialize(host: Host, experiment_id: str) -> None:
     if not agents:
         return
     config = load_toml(package / "fugue.toml")
+    world_definition(ROOT, config["society"], package)
     endpoint = urlsplit(config["society"]["guest_api_url"])
     existing = environments(host)
     for agent in agents:
+        refresh_kit(ROOT, package / "agents/kits" / agent, config["society"], config_dir=package)
         begin_materialization(package, agent)
         name = f"{experiment_id}-{agent}"
         if name in existing:
             created = False
         else:
             sandbox(host, "copy", "base", name)
-            sandbox(host, "restrict-network", name, str(endpoint.hostname), str(endpoint.port))
+            sandbox(host, "restrict-network", name, str(endpoint.hostname), str(endpoint.port), package=package)
             created = True
         archive = package / "agents/homes" / f"{agent}.tar.gz"
         if archive.is_file():
-            sandbox(host, "import-home", name, str(archive))
-        else:
+            sandbox(host, "import-home", name, str(archive), package=package)
+        # Overlay the selected world's kit even over copied homes; preserve all other files.
+        # Legacy honest homes remain untouched unless their kit has world metadata.
+        if not archive.is_file() or (package / "agents/kits" / agent / "onboarding.json").is_file():
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f"fugue-{experiment_id}-{agent}-",
                 suffix=".tar.gz",
@@ -887,11 +960,11 @@ def materialize(host: Host, experiment_id: str) -> None:
             try:
                 with tarfile.open(temporary, "w:gz") as coder_home:
                     coder_home.add(package / "agents/kits" / agent, arcname="society")
-                sandbox(host, "import-home", name, str(temporary))
+                sandbox(host, "import-home", name, str(temporary), package=package)
             finally:
                 temporary.unlink(missing_ok=True)
-        sandbox(host, "sync-openai-auth", name)
-        sandbox(host, "setup-subagents", name)
+        sandbox(host, "sync-openai-auth", name, package=package)
+        sandbox(host, "setup-subagents", name, package=package)
         finish_materialization(package, agent)
         print(f"{'materialized' if created else 'restored'}={name}")
 
@@ -902,7 +975,7 @@ def wait_for_vms_quiescent(host: Host, experiment_id: str, timeout_seconds: floa
         return
     if not host.sandbox:
         raise RuntimeError("host sandbox_bin is not configured")
-    state = Path(host.sandbox).parent / "state"
+    state = Path(host.sandbox_env.get("SANDBOX_STATE_DIR", Path(host.sandbox).parent / "state"))
     pidfiles = {
         f"{experiment_id}-{agent}": state / f"{experiment_id}-{agent}.pid"
         for agent in agents
@@ -962,15 +1035,47 @@ def export_homes(host: Host, experiment_id: str) -> None:
         destination = homes / f"{agent}.tar.gz"
         temporary = homes / f".{agent}.tar.gz"
         temporary.unlink(missing_ok=True)
-        sandbox(host, "export-home", name, str(temporary))
+        sandbox(host, "export-home", name, str(temporary), package=package)
+        policy_marker = homes / f".{agent}.snapshot-policy-v2"
+        if destination.exists() and not policy_marker.exists():
+            # One migration backup only, never an archive per wake or stop.
+            retained = homes / "before-snapshot-policy-v2"
+            retained.mkdir(exist_ok=True)
+            backup = retained / f"{agent}.tar.gz"
+            if not backup.exists():
+                os.link(destination, backup)
+                sync_directory(retained)
         temporary.replace(destination)
+        policy_marker.touch()
+        sync_directory(homes)
         print(f"exported={destination}")
 
 
 def operate(host: Host, experiment_id: str, action: str) -> None:
     with host.lock():
-        package, _ = validate_package_boundary(host, experiment_id)
+        package, config = validate_package_boundary(host, experiment_id)
         state = package_state(package)
+        if action in {"prepare", "start"} and state == "paused":
+            selector = snapshot_world(ROOT, config["society"], package)
+            if selector is not None:
+                rewrite_config(package / "fugue.toml", {("society", "world"): selector})
+                config = load_toml(package / "fugue.toml")
+        if (package / "evidence/control/frozen.json").exists():
+            raise RuntimeError("cohort has a retained operator hold; release it before lifecycle changes")
+        if action in {"prepare", "start"}:
+            port = int(config["api"]["port"])
+            if port >= 65535 or port + 1 in used_ports(host, experiment_id):
+                raise RuntimeError("guest transport port conflicts with another instance; rebind this package")
+        if action == "start":
+            if not Path(host.cohort_hook).is_file():
+                raise RuntimeError("host cohort driver is missing; configure cohort_hook before admission")
+            raw_cutoff = config["society"]["runner"].get("hard_stop_at")
+            if raw_cutoff is not None:
+                cutoff = dt.datetime.fromisoformat(raw_cutoff.replace("Z", "+00:00"))
+                if cutoff.tzinfo is None:
+                    raise RuntimeError("hard_stop_at must include a timezone")
+                if time.time() >= cutoff.timestamp():
+                    raise RuntimeError("experiment hard stop reached; start refused")
         if action == "prepare":
             if state != "paused":
                 raise RuntimeError("experiment must be paused before it can be prepared")
@@ -978,6 +1083,7 @@ def operate(host: Host, experiment_id: str, action: str) -> None:
             begin_transition(package, state, action)
             materialize(host, experiment_id)
             run_fugue(host, experiment_id, "society-services", "prepare")
+            capture_world(host, experiment_id)
             finish_transition(package, "prepared")
         elif action == "start":
             if state not in {"paused", "prepared"}:
@@ -987,9 +1093,9 @@ def operate(host: Host, experiment_id: str, action: str) -> None:
             begin_transition(package, state, action)
             if state == "paused":
                 materialize(host, experiment_id)
-                run_fugue(host, experiment_id, "society-services", "install")
-            else:
-                run_fugue(host, experiment_id, "society-services", "start")
+                run_fugue(host, experiment_id, "society-services", "prepare")
+            capture_world(host, experiment_id)
+            run_fugue(host, experiment_id, "society-services", "start")
             finish_transition(package, "active")
         elif action == "stop":
             if state == "paused":
@@ -1080,7 +1186,7 @@ def status(host: Host, experiment_id: str | None) -> None:
     )
     for item in ids:
         package, _ = validate_package_boundary(host, item)
-        state = package_state(package)
+        state = "held" if (package / "evidence/control/frozen.json").exists() else package_state(package)
         pending = pending_birth_addresses(package)
         pending_field = f" pending_births={','.join(pending)}" if pending else ""
         print(f"experiment={item} state={state}{pending_field} package={package}")
@@ -1090,6 +1196,15 @@ def status(host: Host, experiment_id: str | None) -> None:
 def society(host: Host, experiment_id: str, arguments: list[str]) -> None:
     validate_package_boundary(host, experiment_id)
     run_fugue(host, experiment_id, "society", *arguments)
+
+
+def resume(host: Host, experiment_id: str) -> None:
+    # A retained maintenance operation can hold the host lifecycle lock.
+    package, _ = validate_package_boundary(host, experiment_id)
+    spec = importlib.util.spec_from_file_location("cohort_hook", host.cohort_hook)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.resume(package)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1107,7 +1222,7 @@ def parser() -> argparse.ArgumentParser:
     birth_parser.add_argument("experiment_id")
     birth_parser.add_argument("name")
     birth_parser.add_argument("--role")
-    for name in ("prepare", "start", "stop", "recover", "rebind"):
+    for name in ("prepare", "start", "stop", "recover", "rebind", "resume"):
         action = commands.add_parser(name)
         action.add_argument("experiment_id")
     status_parser = commands.add_parser("status")
@@ -1128,6 +1243,8 @@ def main() -> int:
             copy_experiment(host, args.source_id, args.target_id)
         elif args.command in {"prepare", "start", "stop"}:
             operate(host, args.experiment_id, args.command)
+        elif args.command == "resume":
+            resume(host, args.experiment_id)
         elif args.command == "recover":
             recover(host, args.experiment_id)
         elif args.command == "rebind":

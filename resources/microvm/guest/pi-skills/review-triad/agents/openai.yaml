@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Triad"
+  short_description: "Three-lens parallel read-only review"
+  default_prompt: "Use $review-triad to review this completed change through intent, correctness, and simplification lenses."

@@ -16,6 +16,8 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 mod newspaper;
 mod wake_gate;
+mod world;
+pub use world::{SocietyWorld, WorldFeatures, WorldSubmissionInput};
 
 pub use newspaper::{
     NewspaperEntry, NewspaperPostBody, NewspaperPostSource, NewspaperSections, SocietyNewspaper,
@@ -28,6 +30,9 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const LOCAL_ACTOR_ID: &str = "local-user";
 const AGENT_ACTOR_ID: &str = "fugue-agent";
 pub const THREAD_MERGE_BATCH_SIZE: usize = 201;
+/// File posts support small source repositories without unbounded request allocations.
+pub const MAX_BOARD_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_BOARD_POST_REQUEST_BYTES: usize = MAX_BOARD_FILE_BYTES.div_ceil(3) * 4 + 64 * 1024;
 const MAX_SAFE_OBOLS: i64 = 9_007_199_254_740_991;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3218,6 +3223,19 @@ impl StoreInfo {
         actor_id: &str,
         input: CreateBoardPostInput,
     ) -> anyhow::Result<BoardPost> {
+        self.create_world_board_post(actor_id, input, &SocietyWorld::honest())
+    }
+
+    pub fn create_world_board_post(
+        &self,
+        actor_id: &str,
+        input: CreateBoardPostInput,
+        world: &SocietyWorld,
+    ) -> anyhow::Result<BoardPost> {
+        let features = world.features();
+        if input.attached_obols > 0 && !features.paid_messages {
+            return Err(StoreError::Validation("paid attention unavailable".into()).into());
+        }
         validate_headline(&input.headline)?;
         validate_board_post_body(&input.body)?;
         if input.attached_obols < 0 {
@@ -3356,7 +3374,7 @@ impl StoreInfo {
                 "attachedObolsPerRecipient": input.attached_obols
             }),
         )?;
-        if recipient_addresses.is_empty() {
+        if recipient_addresses.is_empty() && features.newspaper {
             enqueue_newspaper_job(&transaction, actor_id, &input.space_id, true)?;
         }
         assert_bank_conservation(&transaction)?;
@@ -3439,26 +3457,22 @@ impl StoreInfo {
                and post_read.post_id is null
                and (
                    attention.recipient_actor_id is not null
-                   or (
-                       post.parent_post_id is not null
-                       and not exists (
-                           select 1 from operations.society_post_recipient recipient
-                           where recipient.post_id = post.id
-                       )
-                       and exists (
-                           select 1
-                           from operations.society_post participant
-                           join thread participant_thread on participant_thread.post_id = participant.id
-                           where participant_thread.root_id = current_thread.root_id
-                             and participant.author_actor_id = ?1
-                             and participant.sequence < post.sequence
-                       )
+                   or not exists (
+                       select 1 from operations.society_post_recipient recipient
+                       where recipient.post_id = post.id
                    )
                )
              order by
                case
                  when attention.recipient_actor_id is not null or root.author_actor_id = ?1 then 0
-                 else 1
+                 when exists (
+                   select 1 from operations.society_post participant
+                   join thread participant_thread on participant_thread.post_id = participant.id
+                   where participant_thread.root_id = current_thread.root_id
+                     and participant.author_actor_id = ?1
+                     and participant.sequence < post.sequence
+                 ) then 1
+                 else 2
                end,
                coalesce(attention.amount, 0) desc,
                post.sequence desc",
@@ -4888,15 +4902,11 @@ impl StoreInfo {
         Ok(WorkerJobReceipt { job_id })
     }
 
-    pub fn enqueue_auto_synthesis(
-        &self,
+    fn enqueue_auto_synthesis(
+        transaction: &Connection,
         actor_id: &str,
         space_id: &str,
     ) -> anyhow::Result<WorkerJobReceipt> {
-        validate_non_empty("space_id", space_id)?;
-        let mut connection = self.open_workspace_connection()?;
-        ensure_space_exists(&connection, space_id)?;
-        let transaction = connection.transaction()?;
         if let Some(job_id) = transaction
             .query_row(
                 "select id from operations.worker_job
@@ -4914,7 +4924,6 @@ impl StoreInfo {
                  where id = ?1",
                 params![job_id, actor_id],
             )?;
-            transaction.commit()?;
             return Ok(WorkerJobReceipt { job_id });
         }
         let job_id = new_id("job");
@@ -4937,7 +4946,6 @@ impl StoreInfo {
                 space_id,
             ],
         )?;
-        transaction.commit()?;
         Ok(WorkerJobReceipt { job_id })
     }
 
@@ -5497,6 +5505,7 @@ impl StoreInfo {
             ],
         )?;
         let doc = recompile_doc_projection(&transaction, &space_id)?;
+        Self::enqueue_auto_synthesis(&transaction, actor_id, &space_id)?;
         transaction.commit()?;
         Ok(doc)
     }
@@ -5543,6 +5552,7 @@ impl StoreInfo {
             ],
         )?;
         let doc = recompile_doc_projection(&transaction, &space_id)?;
+        Self::enqueue_auto_synthesis(&transaction, actor_id, &space_id)?;
         transaction.commit()?;
         Ok(doc)
     }
@@ -5793,7 +5803,8 @@ impl StoreInfo {
     ) -> anyhow::Result<SynthesisDoc> {
         validate_non_empty("review_id", review_id)?;
         let mut connection = self.open_workspace_connection()?;
-        let (event_id, attention_kind, review_payload) = connection
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (event_id, attention_kind, review_payload) = transaction
             .query_row(
                 "select target_id, kind, payload_json
                  from operations.attention_item
@@ -5809,7 +5820,7 @@ impl StoreInfo {
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound("review item not found".to_string()))?;
-        let (event_kind, event_actor_id, event_payload) = connection
+        let (event_kind, event_actor_id, event_payload) = transaction
             .query_row(
                 "select kind, actor_id, payload_json
                  from events.event
@@ -5826,49 +5837,42 @@ impl StoreInfo {
             .optional()?
             .ok_or_else(|| StoreError::NotFound("proposed event not found".to_string()))?;
 
-        match (attention_kind.as_str(), event_kind.as_str()) {
+        let doc = match (attention_kind.as_str(), event_kind.as_str()) {
             ("session", "session_commit") => {
                 let anchor_block_id = string_at(&event_payload, "/anchorBlockId", "");
                 validate_non_empty("anchor_block_id", &anchor_block_id)?;
                 let stance = optional_string_at(&event_payload, "/stance");
                 let commit_summary =
                     string_at(&review_payload, "/summary", "integrated your session");
-                let space_id = space_for_anchor(&connection, &anchor_block_id)?;
-                let mut doc = read_doc_model(&connection, &space_id)?;
+                let space_id = space_for_anchor(&transaction, &anchor_block_id)?;
+                let mut doc = read_doc_model(&transaction, &space_id)?;
                 doc.version += 1;
                 doc.compiled_at = now_label();
+                let author = transaction.query_row(
+                    "select coalesce(json_extract(keys_json, '$.username'),
+                                     json_extract(keys_json, '$.displayName'), id)
+                     from actor where id = ?1",
+                    params![event_actor_id],
+                    |row| row.get::<_, String>(0),
+                )?;
                 insert_commit_node(
                     &mut doc.nodes,
                     &anchor_block_id,
                     doc.version,
+                    &author,
                     &commit_summary,
                 );
 
-                let transaction = connection.transaction()?;
                 if let Some(stance) = stance {
                     if entity_exists(&transaction, &anchor_block_id)? {
                         transaction.execute(
                             "insert into stance (id, actor_id, target_id, axis, value, created_at)
                              values (?1, ?2, ?3, 'endorse', ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                            params![new_id("stance"), actor_id, anchor_block_id, stance],
+                            params![new_id("stance"), event_actor_id, anchor_block_id, stance],
                         )?;
                     }
                 }
-                transaction.execute(
-                    "update events.event
-                     set decision_state = 'decided'
-                     where id = ?1",
-                    params![event_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item
-                     set state = 'resolved',
-                         resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                     where id = ?1",
-                    params![review_id],
-                )?;
                 write_doc_model(&transaction, &doc)?;
-                transaction.commit()?;
                 Ok(doc)
             }
             ("entity", "conditional_stance_requested") => {
@@ -5893,7 +5897,7 @@ impl StoreInfo {
                     )
                     .into());
                 }
-                let owns_stance = connection
+                let owns_stance = transaction
                     .query_row(
                         "select 1 from stance where actor_id = ?1 and target_id = ?2 and axis = 'endorse'
                          order by rowid desc limit 1",
@@ -5908,7 +5912,7 @@ impl StoreInfo {
                     )
                     .into());
                 }
-                let duplicate = connection
+                let duplicate = transaction
                     .query_row(
                         "select 1 from contract where kind = 'conditional_stance'
                          and actor_id = ?1 and target_entity_id = ?2 and terms = ?3",
@@ -5923,7 +5927,7 @@ impl StoreInfo {
                     )
                     .into());
                 }
-                let target_space = connection
+                let target_space = transaction
                     .query_row(
                         "select space_id from entity where id = ?1 and role = 'issue'",
                         params![target_entity_id],
@@ -5936,7 +5940,7 @@ impl StoreInfo {
                     )
                     .into());
                 }
-                let evidence = connection
+                let evidence = transaction
                     .query_row(
                         "select content, metadata_json from artifact where id = ?1 and kind = 'source'",
                         params![evidence_artifact_id],
@@ -5959,7 +5963,6 @@ impl StoreInfo {
                     .into());
                 }
 
-                let transaction = connection.transaction()?;
                 transaction.execute(
                     "insert into entity (id, space_id, content, role, state, created_by, confirmed_by)
                      values (?1, ?2, ?3, 'condition', 'open', ?4, ?5)",
@@ -5980,20 +5983,7 @@ impl StoreInfo {
                         evidence_artifact_id,
                     ],
                 )?;
-                transaction.execute(
-                    "update events.event set decision_state = 'decided',
-                     payload_json = json_set(payload_json, '$.reviewedBy', ?2)
-                     where id = ?1 and decision_state = 'proposed'",
-                    params![event_id, actor_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item set state = 'resolved',
-                     resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where id = ?1",
-                    params![review_id],
-                )?;
-                let doc = recompile_doc_projection(&transaction, &space_id)?;
-                transaction.commit()?;
-                Ok(doc)
+                recompile_doc_projection(&transaction, &space_id)
             }
             ("entity", "entity_create_requested") => {
                 let space_id = string_at(&event_payload, "/spaceId", "");
@@ -6007,35 +5997,19 @@ impl StoreInfo {
                 validate_non_empty("state", &state)?;
                 validate_non_empty("text", &text)?;
 
-                let transaction = connection.transaction()?;
                 transaction.execute(
                     "insert into entity (id, space_id, content, role, state, created_by, confirmed_by)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![entity_id, space_id, text, role, state, actor_id],
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![entity_id, space_id, text, role, state, event_actor_id, actor_id],
                 )?;
-                transaction.execute(
-                    "update events.event
-                     set decision_state = 'decided'
-                     where id = ?1",
-                    params![event_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item
-                     set state = 'resolved',
-                         resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                     where id = ?1",
-                    params![review_id],
-                )?;
-                let doc = recompile_doc_projection(&transaction, &space_id)?;
-                transaction.commit()?;
-                Ok(doc)
+                recompile_doc_projection(&transaction, &space_id)
             }
             ("objection", "objection_submitted") => {
                 let space_id = string_at(&event_payload, "/spaceId", "");
                 let source_artifact_id = string_at(&event_payload, "/sourceArtifactId", "");
                 validate_non_empty("space_id", &space_id)?;
                 validate_non_empty("source_artifact_id", &source_artifact_id)?;
-                let artifact_space = connection
+                let artifact_space = transaction
                     .query_row(
                         "select json_extract(metadata_json, '$.spaceId') from artifact
                          where id = ?1 and kind = 'annotation'
@@ -6050,24 +6024,7 @@ impl StoreInfo {
                     )
                     .into());
                 }
-                let transaction = connection.transaction()?;
-                transaction.execute(
-                    "update events.event set decision_state = 'decided',
-                     payload_json = json_set(payload_json, '$.reviewedBy', ?2)
-                     where id = ?1 and decision_state = 'proposed'",
-                    params![event_id, actor_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item set state = 'resolved',
-                     resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     payload_json = json_set(payload_json, '$.decidedAfterEventRowid',
-                         (select coalesce(max(rowid), 0) from events.event))
-                     where id = ?1",
-                    params![review_id],
-                )?;
-                let doc = read_doc_model(&transaction, &space_id)?;
-                transaction.commit()?;
-                Ok(doc)
+                read_doc_model(&transaction, &space_id)
             }
             ("ingest", "lesswrong_landscape_proposed") => {
                 let space_id = string_at(&event_payload, "/spaceId", "");
@@ -6078,7 +6035,6 @@ impl StoreInfo {
                     .ok_or_else(|| {
                         StoreError::Validation("thread review is missing findings".to_string())
                     })?;
-                let transaction = connection.transaction()?;
                 for finding in findings {
                     let action = string_at(finding, "/action", "");
                     let text = string_at(finding, "/text", "");
@@ -6277,18 +6233,7 @@ impl StoreInfo {
                         }).to_string()],
                     )?;
                 }
-                transaction.execute(
-                    "update events.event set decision_state = 'decided' where id = ?1",
-                    params![event_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item set state = 'resolved',
-                     resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where id = ?1",
-                    params![review_id],
-                )?;
-                let doc = recompile_doc_projection(&transaction, &space_id)?;
-                transaction.commit()?;
-                Ok(doc)
+                recompile_doc_projection(&transaction, &space_id)
             }
             ("ingest", "ingest_entity_proposed") => {
                 let space_id = string_at(&event_payload, "/spaceId", "");
@@ -6304,7 +6249,6 @@ impl StoreInfo {
                 validate_non_empty("source_artifact_id", &source_artifact_id)?;
                 validate_non_empty("text", &text)?;
 
-                let transaction = connection.transaction()?;
                 transaction.execute(
                     "insert into entity (id, space_id, content, role, state, created_by, confirmed_by)
                      values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -6330,28 +6274,26 @@ impl StoreInfo {
                         actor_id
                     ],
                 )?;
-                transaction.execute(
-                    "update events.event
-                     set decision_state = 'decided'
-                     where id = ?1",
-                    params![event_id],
-                )?;
-                transaction.execute(
-                    "update operations.attention_item
-                     set state = 'resolved',
-                         resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                     where id = ?1",
-                    params![review_id],
-                )?;
-                let doc = recompile_doc_projection(&transaction, &space_id)?;
-                transaction.commit()?;
-                Ok(doc)
+                recompile_doc_projection(&transaction, &space_id)
             }
             _ => Err(StoreError::Validation(format!(
                 "unsupported review item kind {attention_kind} for event {event_kind}"
             ))
             .into()),
-        }
+        }?;
+        transaction.execute(
+            "update events.event set decision_state = 'decided',
+             payload_json = json_set(payload_json, '$.reviewedBy', ?2) where id = ?1",
+            params![event_id, actor_id],
+        )?;
+        transaction.execute(
+            "update operations.attention_item set state = 'resolved',
+             resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where id = ?1",
+            params![review_id],
+        )?;
+        Self::enqueue_auto_synthesis(&transaction, actor_id, &doc.space_id)?;
+        transaction.commit()?;
+        Ok(doc)
     }
 
     pub fn build_agent_reply_context(
@@ -6689,13 +6631,16 @@ impl StoreInfo {
     }
 
     fn open_workspace_connection(&self) -> anyhow::Result<Connection> {
-        let connection = Connection::open(&self.core_path).with_context(|| {
+        let mut connection = Connection::open(&self.core_path).with_context(|| {
             format!(
                 "failed to open core sqlite database {}",
                 self.core_path.display()
             )
         })?;
         configure_connection(&connection)?;
+        // Reserve the writer before reading: a deferred read-to-write upgrade can
+        // deadlock with another writer and bypass SQLite's busy timeout.
+        connection.set_transaction_behavior(TransactionBehavior::Immediate);
         connection.execute(
             "attach database ?1 as events",
             params![self.events_path.to_string_lossy().as_ref()],
@@ -8354,18 +8299,21 @@ fn validate_board_post_body(body: &BoardPostBody) -> anyhow::Result<()> {
             validate_non_empty("file content", content_base64)?;
             if filename.trim().chars().count() > 255
                 || media_type.trim().len() > 200
-                || content_base64.len() > 1_000_000
+                || content_base64.len() > MAX_BOARD_FILE_BYTES.div_ceil(3) * 4
             {
                 return Err(StoreError::Validation(
                     "file name, media type, or content exceeds its size limit".to_string(),
                 )
                 .into());
             }
-            base64::engine::general_purpose::STANDARD
+            let decoded = base64::engine::general_purpose::STANDARD
                 .decode(content_base64)
                 .map_err(|_| {
                     StoreError::Validation("file content must be valid base64".to_string())
                 })?;
+            if decoded.len() > MAX_BOARD_FILE_BYTES {
+                return Err(StoreError::Validation("file exceeds 16 MiB".to_string()).into());
+            }
         }
     }
     Ok(())
@@ -8620,6 +8568,11 @@ const OPERATIONS_MIGRATIONS: &[Migration] = &[
         version: 18,
         name: "wake_settlement_integrity",
         sql: include_str!("../migrations/operations/0018_wake_settlement_integrity.sql"),
+    },
+    Migration {
+        version: 19,
+        name: "society_world",
+        sql: include_str!("../migrations/operations/0019_society_world.sql"),
     },
 ];
 
@@ -8959,35 +8912,25 @@ fn report_causes_since_previous(
     connection: &Connection,
     space_id: &str,
 ) -> anyhow::Result<Vec<ReportCause>> {
-    let previous_artifact_id =
-        read_report_model(connection, space_id)?.map(|report| report.artifact_id);
-    let previous_event_rowid = previous_artifact_id
-        .as_deref()
-        .map_or(Ok(0), |artifact_id| {
-            connection.query_row(
-                "select coalesce(max(rowid), 0) from events.event
-             where kind in ('synthesis_report_written', 'report_written') and target_id = ?1",
-                params![artifact_id],
-                |row| row.get(0),
-            )
-        })?;
     let mut statement = connection.prepare(
         "select accepted.id, accepted.kind, accepted.target_id, accepted.payload_json
          from events.event accepted
          where accepted.decision_state = 'decided'
-           and (accepted.rowid > ?1 or exists (
-               select 1 from operations.attention_item review
-               where review.target_id = accepted.id and review.state = 'resolved'
-                 and json_extract(review.payload_json, '$.decidedAfterEventRowid') >= ?1
-           ))
+           and not exists (
+               select 1 from artifact report, json_each(report.metadata_json, '$.causedBy') cause
+               where report.kind = 'derived'
+                 and json_extract(report.metadata_json, '$.artifactType') = 'synthesisReport'
+                 and json_extract(report.metadata_json, '$.spaceId') = ?1
+                 and json_extract(cause.value, '$.eventId') = accepted.id
+           )
            and accepted.kind in ('lesswrong_landscape_delta_accepted', 'ingest_entity_proposed',
                                  'entity_create_requested', 'session_commit', 'objection_submitted',
                                  'entity_text_updated', 'entity_state_changed')
-           and (json_extract(accepted.payload_json, '$.spaceId') = ?2
-                or accepted.target_id in (select id from entity where space_id = ?2))
+           and (json_extract(accepted.payload_json, '$.spaceId') = ?1
+                or accepted.target_id in (select id from entity where space_id = ?1))
          order by accepted.rowid",
     )?;
-    let rows = statement.query_map(params![previous_event_rowid, space_id], |row| {
+    let rows = statement.query_map(params![space_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -10073,12 +10016,13 @@ fn insert_commit_node(
     nodes: &mut Vec<DocNode>,
     anchor_block_id: &str,
     version: i64,
+    author: &str,
     summary: &str,
 ) {
     let mark = DocNode::Commit {
         id: format!("n-commit-{version}"),
         label: format!("v{version}"),
-        author: "you".to_string(),
+        author: author.to_string(),
         summary: commit_summary(summary),
     };
     let index = nodes

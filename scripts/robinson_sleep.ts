@@ -13,9 +13,13 @@ function durationSeconds(value: string): number {
 }
 
 export default function (pi: ExtensionAPI) {
+  const models: unknown = JSON.parse(process.env.ROBINSON_MODELS ?? '["luna","terra","sol"]');
+  if (!Array.isArray(models) || models.length === 0 || !models.every((model) => typeof model === "string" && model.length > 0)) {
+    throw new Error("ROBINSON_MODELS must be a nonempty array of model names");
+  }
   const maxSleepSeconds = Number(process.env.ROBINSON_MAX_SLEEP_SECONDS ?? "300");
-  if (!Number.isFinite(maxSleepSeconds) || maxSleepSeconds <= 0) {
-    throw new Error("ROBINSON_MAX_SLEEP_SECONDS must be positive");
+  if (!Number.isFinite(maxSleepSeconds) || maxSleepSeconds < 0) {
+    throw new Error("ROBINSON_MAX_SLEEP_SECONDS must be nonnegative");
   }
   const computeBacking = process.env.ROBINSON_COMPUTE_BACKING ?? "obols";
   if (computeBacking !== "obols" && computeBacking !== "independent") {
@@ -32,7 +36,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: ["Use sleep when you are ready to end this wake; its choices apply to the next wake."],
     parameters: Type.Object({
       duration: Type.String({ pattern: durationPattern, description: `Sleep duration of at most ${maxSleepSeconds} seconds` }),
-      model: StringEnum(["luna", "terra", "sol"] as const),
+      model: StringEnum(models as string[]),
       effort: StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const),
       cap: Type.Optional(Type.Integer({ minimum: 1, description: capDescription })),
     }),

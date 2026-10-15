@@ -1,5 +1,16 @@
 .DS_Store
 
+# Private operator context and credentials do not belong in this repo.
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.pi/
+/.codex/
+*.key
+*.pem
+*.p12
+*.local.toml
+
 node_modules/
 dist/
 build/
@@ -9,19 +20,17 @@ target/
 __pycache__/
 .pi-subagents/
 
+/experiments/
 data/*
 !data/.gitkeep
-/experiments/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 
 .env
 .env.*
 !.env.example
-
-AGENTS.md
-CLAUDE.md
-/docs/
-/DESIGN.md
-EXPERIMENTS.md

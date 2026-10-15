@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSETS="${SANDBOX_ASSETS_DIR:-$ROOT/assets}"
+STATE="${SANDBOX_STATE_DIR:-$ROOT/state}"
+if [[ -n "${SANDBOX_VOLUME_MOUNT:-}" ]]; then
+  python3 -c 'import os,sys; p=sys.argv[1]; sys.exit(os.stat(p).st_dev == os.stat(os.path.dirname(p)).st_dev)' "$SANDBOX_VOLUME_MOUNT" \
+    || { echo "sandbox: required bounded volume is not mounted" >&2; exit 1; }
+fi
+ENVS="$STATE/environments"
+CONTROL="$STATE/control"
+mkdir -p "$STATE/tmp"
+export TMPDIR="$STATE/tmp"
+MKE2FS="${MKE2FS:-/opt/homebrew/opt/e2fsprogs/sbin/mke2fs}"
+DEBUGFS="${DEBUGFS:-/opt/homebrew/opt/e2fsprogs/sbin/debugfs}"
+CPUS="${SANDBOX_CPUS:-}"
+MEMORY_MIB="${SANDBOX_MEMORY_MIB:-}"
+CPUS_DEFAULT=2
+MEMORY_MIB_DEFAULT=1024
+DISK_GIB="${SANDBOX_DISK_GIB:-6}"
+
+die() { echo "sandbox: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing $1"; }
+valid_name() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die "invalid environment name: $1"; }
+disk_path() { printf '%s/%s.raw' "$ENVS" "$1"; }
+size_path() { printf '%s/%s.size' "$ENVS" "$1"; }
+
+# Effective sizing: explicit SANDBOX_* env > per-environment size file > default.
+resolve_size() {
+  local name="$1" file_cpus="" file_mem=""
+  if [[ -f "$(size_path "$name")" ]]; then
+    file_cpus="$(sed -n 's/^CPUS=\([0-9]\{1,\}\)$/\1/p' "$(size_path "$name")")"
+    file_mem="$(sed -n 's/^MEMORY_MIB=\([0-9]\{1,\}\)$/\1/p' "$(size_path "$name")")"
+  fi
+  EFFECTIVE_CPUS="${CPUS:-${file_cpus:-$CPUS_DEFAULT}}"
+  EFFECTIVE_MEMORY_MIB="${MEMORY_MIB:-${file_mem:-$MEMORY_MIB_DEFAULT}}"
+}
+
+set_size() {
+  local name="$1" cpus="$2" mem="$3"
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  [[ "$cpus" =~ ^[0-9]+$ && "$cpus" -ge 1 ]] || die "CPUS must be a positive integer"
+  [[ "$mem" =~ ^[0-9]+$ && "$mem" -ge 256 ]] || die "MEMORY_MIB must be an integer >= 256"
+  printf 'CPUS=%s\nMEMORY_MIB=%s\n' "$cpus" "$mem" > "$(size_path "$name")"
+  echo "sandbox: $name sized at ${cpus} cpus, ${mem} MiB"
+}
+
+show_size() {
+  local name="$1"
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  resolve_size "$name"
+  echo "$name: ${EFFECTIVE_CPUS} cpus, ${EFFECTIVE_MEMORY_MIB} MiB$([[ -f "$(size_path "$name")" ]] || printf ' (default)')"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./sandbox COMMAND [ARGS]
+
+  build                         build the preinstalled base environment
+  copy SOURCE NAME              make a copy-on-write environment clone
+  shell [NAME]                  open an interactive shell (default: base)
+  run NAME -- COMMAND [ARGS...] run a command inside an environment
+  git-job NAME DESTINATION BASE_REF BRANCH OUTPUT HOST_REPO -- COMMAND [ARGS...]
+                                run, import a verified checkpoint, then delete
+  export-git NAME DESTINATION BASE_REF BRANCH OUTPUT HOST_REPO
+                                checkpoint and export a guest Git branch
+  sync-openai-auth [NAME]       import an explicit dedicated Codex credential
+  export-home NAME ARCHIVE      export persistent coder state to a verified archive
+  import-home NAME ARCHIVE      restore a trusted coder-home tar archive
+  import-git NAME REPO BRANCH DESTINATION
+                                import an exact branch into an allowed guest path
+  set-env NAME KEY              read and store a guest environment value
+  restrict-network NAME HOST PORT
+                                remove guest sudo and allow only this private endpoint
+  setup-subagents [NAME]        install Pi read-only delegation policy
+  list                          list environments and sizes
+  size NAME [CPUS MEMORY_MIB]   show or persist per-environment VM sizing
+  delete NAME                   delete an environment (base is protected)
+EOF
+}
+
+make_control() {
+  local name="$1" source_dir="$2" size_mib="${3:-16}" image
+  mkdir -p "$CONTROL"
+  image="$(mktemp "$CONTROL/$name.XXXXXX")"
+  if ! "$MKE2FS" -q -t ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 \
+    -L sandbox-control -d "$source_dir" "$image" "${size_mib}M"; then
+    rm -f "$image"
+    return 1
+  fi
+  printf '%s' "$image"
+}
+
+acquire_vm_lock() {
+  local name="$1" lock owner
+  mkdir -p "$STATE/locks"
+  lock="$STATE/locks/$name.lock"
+  while ! (set -o noclobber; printf '%s\n' "$$" > "$lock") 2>/dev/null; do
+    owner="$(cat "$lock" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+      sleep 0.1
+    else
+      rm -f "$lock"
+    fi
+  done
+  printf '%s' "$lock"
+}
+
+release_vm_lock() {
+  local lock="$1" owner
+  owner="$(cat "$lock" 2>/dev/null || true)"
+  [[ "$owner" != "$$" ]] || rm -f "$lock"
+}
+
+run_vm() {
+  local name="$1" control_image="$2" console="$3"
+  local disk pidfile vm_lock vfkit_status mac_address
+  disk="$(disk_path "$name")"
+  pidfile="$STATE/$name.pid"
+  [[ -f "$disk" ]] || die "no environment named $name"
+  [[ -f "$ASSETS/vmlinux" && -f "$ASSETS/initramfs.gz" ]] || die "run ./sandbox build first"
+  vm_lock="$(acquire_vm_lock "$name")"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    release_vm_lock "$vm_lock"
+    die "$name is already running"
+  fi
+  rm -f "$pidfile"
+  local serial="virtio-serial,stdio"
+  if [[ "$console" == log ]]; then
+    rm -f "$STATE/$name.console.log"
+    serial="virtio-serial,logFilePath=$STATE/$name.console.log"
+  fi
+  resolve_size "$name"
+  mac_address="$(python3 -c 'import hashlib,sys; h=hashlib.sha256(sys.argv[1].encode()).hexdigest()[:10]; print("02:"+":".join(h[i:i+2] for i in range(0,10,2)))' "$STATE/$name")"
+  vfkit_status=0
+  local network="virtio-net,nat,mac=$mac_address"
+  local rest_uri="${SANDBOX_REST_URI:-none://}"
+  if [[ -n "${SANDBOX_NET_SOCKET:-}" ]]; then
+    [[ -S "$SANDBOX_NET_SOCKET" ]] || die "network socket is not ready"
+    network="virtio-net,unixSocketPath=$SANDBOX_NET_SOCKET,mac=$mac_address"
+  fi
+  if [[ -n "${SANDBOX_REST_URI:-}" ]]; then
+    [[ "$SANDBOX_REST_URI" == http://127.0.0.1:* ]] || die "control endpoint must be loopback"
+  fi
+  vfkit --restful-uri "$rest_uri" \
+    --log-level error \
+    --cpus "$EFFECTIVE_CPUS" \
+    --memory "$EFFECTIVE_MEMORY_MIB" \
+    --pidfile "$pidfile" \
+    --bootloader "linux,kernel=$ASSETS/vmlinux,initrd=$ASSETS/initramfs.gz,cmdline=console=hvc0 loglevel=3 ramdisk_size=524288" \
+    --device "virtio-blk,path=$disk" \
+    --device "virtio-blk,path=$control_image" \
+    --device "$network" \
+    --device "$serial" \
+    --device virtio-rng || vfkit_status=$?
+  if [[ "$vfkit_status" -ne 0 ]]; then
+    rm -f "$pidfile"
+    release_vm_lock "$vm_lock"
+    return "$vfkit_status"
+  fi
+  local guest_status=1
+  if [[ "$console" == log && -f "$STATE/$name.console.log" ]]; then
+    parsed_status="$(sed -n 's/^--- sandbox exit: \([0-9][0-9]*\) ---\r*$/\1/p' "$STATE/$name.console.log" | tail -1)"
+    [[ -z "$parsed_status" ]] || guest_status="$parsed_status"
+    if grep -q '^--- sandbox output ---' "$STATE/$name.console.log"; then
+      sed -n '/^--- sandbox output ---/,$p' "$STATE/$name.console.log" | tr -d '\r'
+    else
+      tr -d '\r' < "$STATE/$name.console.log"
+    fi
+  fi
+  rm -f "$pidfile"
+  release_vm_lock "$vm_lock"
+  return "$guest_status"
+}
+
+build() {
+  need vfkit; need curl; need zstd; need cpio; need jq
+  [[ -x "$MKE2FS" ]] || die "missing mke2fs; install e2fsprogs with Homebrew"
+  mkdir -p "$ASSETS" "$ENVS" "$CONTROL"
+  "$ROOT/scripts/fetch-assets.sh"
+  "$ROOT/scripts/build-initramfs.sh"
+  local disk stage ctl_dir ctl status
+  disk="$(disk_path base)"
+  if [[ ! -f "$disk" ]]; then
+    stage="$(mktemp -d)"
+    trap 'rm -rf "$stage"' RETURN
+    tar -xzf "$ASSETS/alpine-minirootfs.tar.gz" -C "$stage"
+    mkdir -p "$stage/usr/local/sbin"
+    mkdir -p "$stage/usr/local/share/sandbox"
+    mkdir -p "$stage/tmp"
+    chmod 1777 "$stage/tmp"
+    install -m 0755 "$ROOT/guest/sandbox-provision" "$stage/usr/local/sbin/sandbox-provision"
+    install -m 0755 "$ROOT/guest/setup-pi-subagents" "$stage/usr/local/sbin/setup-pi-subagents"
+    cp -R "$ROOT/guest/pi-skills" "$stage/usr/local/share/sandbox/pi-skills"
+    cp -R "$ROOT/guest/pi-agents" "$stage/usr/local/share/sandbox/pi-agents"
+    truncate -s "${DISK_GIB}G" "$disk"
+    "$MKE2FS" -q -t ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 \
+      -L coding-sandbox -d "$stage" "$disk"
+    ctl_dir="$(mktemp -d)"
+    printf 'provision\n' > "$ctl_dir/mode"
+    ctl="$(make_control provision "$ctl_dir")"
+    rm -rf "$ctl_dir"
+    status=0
+    run_vm base "$ctl" log || status=$?
+    rm -f "$ctl"
+    if [[ "$status" -ne 0 ]] || ! grep -q 'sandbox: base environment ready' "$STATE/base.console.log"; then
+      rm -f "$disk"
+      die "base provisioning failed; incomplete disk removed"
+    fi
+  fi
+  echo "sandbox: base environment ready"
+}
+
+copy_env() {
+  local source="$1" name="$2"
+  valid_name "$source"; valid_name "$name"
+  [[ -f "$(disk_path "$source")" ]] || die "no environment named $source"
+  [[ ! -e "$(disk_path "$name")" ]] || die "environment already exists: $name"
+  cp -c "$(disk_path "$source")" "$(disk_path "$name")"
+  echo "sandbox: copied $source to $name"
+}
+
+run_command() {
+  local name="$1"; shift
+  [[ "${1:-}" == -- ]] && shift
+  [[ "$#" -gt 0 ]] || die "run requires a command after --"
+  local dir ctl status
+  dir="$(mktemp -d)"
+  printf 'command\n' > "$dir/mode"
+  if [[ -n "${SANDBOX_CODEX_AUTH:-}" ]]; then
+    write_access_auth "$dir/auth.json"
+  fi
+  {
+    printf 'set -e\n'
+    if [[ -f "$dir/auth.json" ]]; then
+      printf 'mkdir -p "$HOME/.pi/agent"\ninstall -m 0600 /run/sandbox-control/auth.json "$HOME/.pi/agent/auth.json"\n'
+    fi
+    printf 'exec '
+    printf '%q ' "$@"
+    printf '\n'
+  } > "$dir/command.sh"
+  chmod 0755 "$dir/command.sh"
+  ctl="$(make_control command "$dir")"
+  rm -rf "$dir"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  return "$status"
+}
+
+valid_git_destination() {
+  [[ "$1" == "/home/coder/project" || \
+     "$1" =~ ^/home/coder/repositories/[a-z0-9][a-z0-9-]*$ ]]
+}
+
+export_git() {
+  local name="$1" destination="$2" base_ref="$3" branch="$4" output="$5" host_repo="$6"
+  local script capture encoded status=0
+  valid_name "$name"
+  valid_git_destination "$destination" || die "invalid Git export destination: $destination"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  git -C "$host_repo" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "not a host Git repository: $host_repo"
+  git -C "$host_repo" show-ref --verify --quiet "refs/heads/$base_ref" \
+    || die "host repository has no local branch named $base_ref"
+  [[ -n "$base_ref" && -n "$branch" ]] || die "Git export refs must not be empty"
+  [[ ! -e "$output" ]] || die "Git export output already exists: $output"
+  mkdir -p "$(dirname "$output")"
+  capture="$(mktemp "$CONTROL/export-output.XXXXXX")"
+  encoded="$(mktemp "$CONTROL/export-bundle.XXXXXX")"
+  printf -v script \
+    'set -euo pipefail; cd %q; git show-ref --verify --quiet %q; git show-ref --verify --quiet %q; if test -n "$(git status --porcelain)"; then git add -A; git -c user.name="Sandbox Checkpoint" -c user.email="sandbox-checkpoint@localhost" -c commit.gpgSign=false commit --no-verify -m "chore: checkpoint sandbox job" >/tmp/sandbox-checkpoint.log 2>&1; fi; git bundle create /tmp/sandbox-result.bundle %q >/tmp/sandbox-bundle.log 2>&1; printf "%%s\\n" "--- sandbox bundle begin ---"; base64 /tmp/sandbox-result.bundle; printf "%%s\\n" "--- sandbox bundle end ---"' \
+    "$destination" "refs/heads/$base_ref" "refs/heads/$branch" "$base_ref..$branch"
+  run_command "$name" -- bash -lc "$script" >"$capture" || status=$?
+  [[ "$status" -eq 0 ]] || { cat "$capture"; die "guest Git export failed with status $status"; }
+  awk '/^--- sandbox bundle begin ---$/{inside=1;next} /^--- sandbox bundle end ---$/{inside=0} inside{print}' \
+    "$capture" >"$encoded"
+  [[ -s "$encoded" ]] || die "guest Git export produced no bundle"
+  if ! base64 -D -i "$encoded" -o "$output"; then
+    rm -f "$output"
+    die "failed to decode exported Git bundle"
+  fi
+  if ! git -C "$host_repo" bundle verify "$output" >/dev/null 2>&1; then
+    rm -f "$output"
+    die "exported Git bundle failed verification"
+  fi
+  if ! git bundle list-heads "$output" | grep -Fq "refs/heads/$branch"; then
+    rm -f "$output"
+    die "exported bundle does not contain $branch"
+  fi
+  rm -f "$capture" "$encoded"
+  echo "sandbox: exported $branch from $name:$destination to $output"
+}
+
+import_exported_git() {
+  local name="$1" branch="$2" bundle="$3" host_repo="$4"
+  local guest_ref expected host_ref actual
+  guest_ref="refs/heads/$branch"
+  git check-ref-format "$guest_ref" >/dev/null 2>&1 \
+    || die "invalid Git export branch: $branch"
+  expected="$(git bundle list-heads "$bundle" | awk -v ref="$guest_ref" '$2 == ref { print $1 }')"
+  [[ -n "$expected" ]] || die "exported bundle does not contain exactly $guest_ref"
+  host_ref="refs/heads/sandbox/$name/$branch/$expected"
+  git check-ref-format "$host_ref" >/dev/null 2>&1 \
+    || die "invalid recovery ref: $host_ref"
+  git -C "$host_repo" fetch --quiet "$bundle" "$guest_ref:$host_ref" \
+    || die "failed to import exported commit into host repository"
+  actual="$(git -C "$host_repo" rev-parse --verify "$host_ref^{commit}")"
+  [[ "$actual" == "$expected" ]] \
+    || die "host recovery ref does not match exported commit"
+  echo "sandbox: verified host recovery branch ${host_ref#refs/heads/} at $expected"
+}
+
+git_job() {
+  local name="$1" destination="$2" base_ref="$3" branch="$4" output="$5" host_repo="$6"
+  shift 6
+  [[ "${1:-}" == -- ]] && shift
+  [[ "$#" -gt 0 ]] || die "git-job requires a command after --"
+  local command_status=0 export_status=0
+  run_command "$name" -- "$@" || command_status=$?
+  export_git "$name" "$destination" "$base_ref" "$branch" "$output" "$host_repo" \
+    || export_status=$?
+  [[ "$export_status" -eq 0 ]] \
+    || die "job exited with status $command_status and Git export failed"
+  import_exported_git "$name" "$branch" "$output" "$host_repo"
+  [[ "$command_status" -eq 0 ]] \
+    || die "job exited with status $command_status; its checkpoint was imported and the environment was retained"
+  delete_env "$name"
+  echo "sandbox: completed $name; verified checkpoint retained on host"
+}
+
+shell_env() {
+  local name="${1:-base}" dir ctl status
+  [[ -t 0 && -t 1 ]] || die "shell needs an interactive terminal"
+  dir="$(mktemp -d)"
+  printf 'shell\n' > "$dir/mode"
+  ctl="$(make_control shell "$dir")"
+  rm -rf "$dir"
+  status=0
+  run_vm "$name" "$ctl" stdio || status=$?
+  rm -f "$ctl"
+  return "$status"
+}
+
+write_access_auth() {
+  local destination="$1" codex_auth="${SANDBOX_CODEX_AUTH:-}" expires
+  [[ -n "$codex_auth" ]] || die "set SANDBOX_CODEX_AUTH to a dedicated sandbox Codex auth.json"
+  [[ -f "$codex_auth" ]] || die "missing $codex_auth"
+  expires="$(jq -r '.tokens.access_token | split(".")[1] | @base64d | fromjson | .exp * 1000' "$codex_auth")"
+  [[ "$expires" -gt "$(( $(date +%s) * 1000 ))" ]] || die "Codex access token expired; host refresh is not permitted"
+  # Pi requires OAuth-shaped storage for this Codex subscription provider.
+  # Empty refresh is deliberate: no host refresh material enters the guest.
+  jq --argjson expires "$expires" '{
+    "openai-codex": {type: "oauth", access: .tokens.access_token,
+      refresh: "", expires: $expires, accountId: .tokens.account_id}
+  }' "$codex_auth" > "$destination"
+  # The root-owned control disk must let guest uid 1000 read this access-only file.
+  # Its host temporary directory and disk image remain private.
+  chmod 0644 "$destination"
+}
+
+sync_auth() {
+  local name="${1:-base}" dir ctl status
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  write_access_auth "$dir/auth.json"
+  printf 'import-auth\n' > "$dir/mode"
+  ctl="$(make_control auth "$dir")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  [[ "$status" -eq 0 ]] || return "$status"
+  echo "sandbox: imported access-only Codex subscription credential into Pi in $name"
+}
+
+import_home() {
+  local name="$1" archive="$2" dir archive_kib size_mib ctl status
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  [[ -f "$archive" ]] || die "home archive does not exist: $archive"
+  need python3
+  python3 - "$archive" <<'PY' || die "home archive contains an unsafe path or entry type"
+import pathlib
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    for member in archive.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or member.isdev() or member.isfifo():
+            raise SystemExit(1)
+        if member.issym() or member.islnk():
+            target = pathlib.PurePosixPath(member.linkname)
+            if target.is_absolute():
+                raise SystemExit(1)
+            combined = (path.parent / target).parts if member.issym() else target.parts
+            depth = 0
+            for part in combined:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    depth -= 1
+                else:
+                    depth += 1
+                if depth < 0:
+                    raise SystemExit(1)
+PY
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  install -m 0600 "$archive" "$dir/home.tar.gz"
+  printf 'import-home\n' > "$dir/mode"
+  archive_kib="$(du -k "$archive" | awk '{print $1}')"
+  size_mib="$((archive_kib / 1024 + 32))"
+  ctl="$(make_control import-home "$dir" "$size_mib")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  [[ "$status" -eq 0 ]] || return "$status"
+  echo "sandbox: imported coder home into $name"
+}
+
+export_home() {
+  local name="$1" archive="$2" measurement raw_bytes size_mib dir ctl status
+  local extracted checksum expected actual
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  [[ ! -e "$archive" ]] || die "home export output already exists: $archive"
+  [[ -x "$DEBUGFS" ]] || die "missing debugfs; install e2fsprogs with Homebrew"
+  mkdir -p "$(dirname "$archive")"
+
+  measurement="$(run_command "$name" -- sh -lc \
+    'python3 /usr/local/sbin/home_snapshot.py --measure')"
+  raw_bytes="$(printf '%s\n' "$measurement" | awk '/^[0-9]+$/ { value=$1 } END { print value }')"
+  [[ "$raw_bytes" =~ ^[0-9]+$ ]] || die "could not measure coder home for export"
+  size_mib="$(( (raw_bytes + 1048575) / 1048576 + 128 ))"
+
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"; rm -f "${ctl:-}" "${extracted:-}" "${checksum:-}"' RETURN
+  printf 'export-home\n' > "$dir/mode"
+  ctl="$(make_control export-home "$dir" "$size_mib")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  [[ "$status" -eq 0 ]] || return "$status"
+
+  extracted="$(mktemp /tmp/sandbox-home-export.XXXXXX)"
+  checksum="$(mktemp /tmp/sandbox-home-checksum.XXXXXX)"
+  "$DEBUGFS" -R "dump /home.tar.gz $extracted" "$ctl" >/dev/null 2>&1 \
+    || die "failed to extract coder home from control disk"
+  "$DEBUGFS" -R "dump /home.tar.gz.sha256 $checksum" "$ctl" >/dev/null 2>&1 \
+    || die "failed to extract coder home checksum from control disk"
+  expected="$(awk 'NR == 1 { print $1 }' "$checksum")"
+  actual="$(shasum -a 256 "$extracted" | awk '{ print $1 }')"
+  [[ -n "$expected" && "$actual" == "$expected" ]] \
+    || die "coder home export checksum mismatch"
+  tar -tzf "$extracted" >/dev/null || die "coder home export is not a valid tar archive"
+  mv "$extracted" "$archive"
+  extracted=""
+  echo "sandbox: exported coder home from $name to $archive"
+}
+
+import_git() {
+  local name="$1" source_repo="$2" branch="$3" destination="$4"
+  local ref commit git_name git_email dir bundle_kib size_mib ctl status
+  valid_name "$name"
+  [[ "$destination" == "/home/coder/project" || \
+     "$destination" =~ ^/home/coder/repositories/[a-z0-9][a-z0-9-]*$ ]] \
+    || die "invalid Git import destination: $destination"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1 || die "not a Git repository: $source_repo"
+  ref="refs/heads/$branch"
+  git -C "$source_repo" show-ref --verify --quiet "$ref" || die "no local branch named $branch"
+  commit="$(git -C "$source_repo" rev-parse "$ref^{commit}")"
+  git_name="$(git -C "$source_repo" config user.name || true)"
+  git_email="$(git -C "$source_repo" config user.email || true)"
+
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  git -C "$source_repo" bundle create "$dir/repo.bundle" "$ref"
+  printf 'import-git\n' > "$dir/mode"
+  printf '%s\n' "$branch" > "$dir/branch"
+  printf '%s\n' "$commit" > "$dir/commit"
+  printf '%s\n' "$git_name" > "$dir/git-name"
+  printf '%s\n' "$git_email" > "$dir/git-email"
+  printf '%s\n' "$destination" > "$dir/destination"
+  bundle_kib="$(du -k "$dir/repo.bundle" | awk '{print $1}')"
+  size_mib="$((bundle_kib / 1024 + 32))"
+  ctl="$(make_control import-git "$dir" "$size_mib")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  [[ "$status" -eq 0 ]] || return "$status"
+  echo "sandbox: imported $branch at $commit into $name:$destination"
+}
+
+set_env() {
+  local name="$1" key="$2" value dir ctl status
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid environment key: $key"
+  if [[ -t 0 ]]; then
+    printf 'Value for %s: ' "$key" >&2
+    IFS= read -r -s value
+    printf '\n' >&2
+  else
+    IFS= read -r value
+  fi
+  [[ -n "$value" ]] || die "empty value for $key"
+
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  printf 'set-env\n' > "$dir/mode"
+  printf '%s\n' "$key" > "$dir/key"
+  { printf '%s=' "$key"; printf '%q' "$value"; printf '\n'; } > "$dir/assignment"
+  chmod 0600 "$dir/assignment"
+  ctl="$(make_control set-env "$dir")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  return "$status"
+}
+
+valid_ipv4() {
+  local address="$1" octet
+  local -a octets
+  [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<<"$address"
+  for octet in "${octets[@]}"; do
+    [[ "$octet" -le 255 ]] || return 1
+  done
+}
+
+restrict_network() {
+  local name="$1" allowed_host="$2" allowed_port="$3" dir ctl status
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  valid_ipv4 "$allowed_host" || die "allowed host must be an IPv4 address"
+  [[ "$allowed_port" =~ ^[0-9]+$ && "$allowed_port" -ge 1 && "$allowed_port" -le 65535 ]] \
+    || die "allowed port must be an integer from 1 through 65535"
+
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  printf 'restrict-network\n' > "$dir/mode"
+  printf '%s\n' "$allowed_host" > "$dir/allowed-host"
+  printf '%s\n' "$allowed_port" > "$dir/allowed-port"
+  ctl="$(make_control restrict-network "$dir")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  [[ "$status" -eq 0 ]] || return "$status"
+  echo "sandbox: restricted $name to public internet plus $allowed_host:$allowed_port"
+}
+
+setup_subagents() {
+  local name="${1:-base}" dir ctl status
+  valid_name "$name"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  printf 'setup-subagents\n' > "$dir/mode"
+  install -m 0755 "$ROOT/guest/setup-pi-subagents" "$dir/setup-pi-subagents"
+  cp -R "$ROOT/guest/pi-skills" "$dir/pi-skills"
+  cp -R "$ROOT/guest/pi-agents" "$dir/pi-agents"
+  ctl="$(make_control setup-subagents "$dir")"
+  status=0
+  run_vm "$name" "$ctl" log || status=$?
+  rm -f "$ctl"
+  return "$status"
+}
+
+list_envs() {
+  mkdir -p "$ENVS"
+  find "$ENVS" -maxdepth 1 -type f -name '*.raw' -print0 \
+    | while IFS= read -r -d '' disk; do
+        name="$(basename "$disk" .raw)"
+        printf '%-24s %s\n' "$name" "$(du -h "$disk" | awk '{print $1}')"
+      done
+}
+
+delete_env() {
+  local name="$1"
+  valid_name "$name"
+  [[ "$name" != base ]] || die "base is protected; copy it instead"
+  [[ -f "$(disk_path "$name")" ]] || die "no environment named $name"
+  rm "$(disk_path "$name")"
+  rm -f "$(size_path "$name")"
+  echo "sandbox: deleted $name"
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || { usage; exit 1; }
+shift
+case "$command" in
+  capabilities) printf '%s\n' 'unixgram vm-rest' ;;
+  build) build "$@" ;;
+  copy) [[ "$#" == 2 ]] || die "copy requires SOURCE NAME"; copy_env "$@" ;;
+  shell) [[ "$#" -le 1 ]] || die "shell takes at most one NAME"; shell_env "$@" ;;
+  run) [[ "$#" -ge 3 ]] || die "run requires NAME -- COMMAND"; name="$1"; shift; run_command "$name" "$@" ;;
+  git-job) [[ "$#" -ge 8 ]] || die "git-job requires NAME DESTINATION BASE_REF BRANCH OUTPUT HOST_REPO -- COMMAND"; git_job "$@" ;;
+  export-git) [[ "$#" == 6 ]] || die "export-git requires NAME DESTINATION BASE_REF BRANCH OUTPUT HOST_REPO"; export_git "$@" ;;
+  sync-openai-auth) [[ "$#" -le 1 ]] || die "sync-openai-auth takes at most one NAME"; sync_auth "$@" ;;
+  export-home) [[ "$#" == 2 ]] || die "export-home requires NAME ARCHIVE"; export_home "$@" ;;
+  import-home) [[ "$#" == 2 ]] || die "import-home requires NAME ARCHIVE"; import_home "$@" ;;
+  import-git) [[ "$#" == 4 ]] || die "import-git requires NAME REPO BRANCH DESTINATION"; import_git "$@" ;;
+  set-env) [[ "$#" == 2 ]] || die "set-env requires NAME KEY"; set_env "$@" ;;
+  restrict-network) [[ "$#" == 3 ]] || die "restrict-network requires NAME HOST PORT"; restrict_network "$@" ;;
+  setup-subagents) [[ "$#" -le 1 ]] || die "setup-subagents takes at most one NAME"; setup_subagents "$@" ;;
+  list) list_envs ;;
+  size) case "$#" in 1) show_size "$1" ;; 3) set_size "$1" "$2" "$3" ;; *) die "size requires NAME, or NAME CPUS MEMORY_MIB" ;; esac ;;
+  delete) [[ "$#" == 1 ]] || die "delete requires NAME"; delete_env "$1" ;;
+  -h|--help|help) usage ;;
+  *) usage; die "unknown command: $command" ;;
+esac

@@ -1,0 +1,193 @@
+{
+  "data": {
+    "post": {
+      "result": {
+        "_id": "BBd2EJywf2xXftyFn",
+        "title": "Selective Optimism: a critique of AI 2040",
+        "slug": "selective-optimism-a-critique-of-ai-2040",
+        "postedAt": "2026-07-09T19:43:10.992Z",
+        "contents": {
+          "plaintextMainText": "Some context for this post: I’ve been working part-time as a consultant for the AI Futures Project over the last year. Most of the work I’ve done for them has involved critiquing and suggesting improvements for their AI 2040 scenario—some of which were addressed, and some of which weren’t. To their credit, they asked me to write up my remaining critiques into a post that would accompany its launch. In the rest of this post I’ll discuss my three biggest high-level criticisms of AI 2040.\n\nBefore doing so, I want to emphasize that there are many interesting and thought-provoking details in the scenario. I’ve focused on the high-level framing of the scenario because that’s where my main disagreements lie; given the scope of these disagreements, it’s hard to evaluate the details.\n\nSince the AI Futures Project paid me to develop and write this criticism, you shouldn’t take this as a fully unbiased perspective. However, they haven’t reviewed this piece, and in general have been open-minded about receiving criticism (as their request for me to post this today demonstrates).\n\nFinally: the preview image for the substack version of this post comes from this video of a dad shouting to his son “don’t crash into the tree!” The relevance will hopefully become apparent.\n\n\nForecast vs recommendation\n\nThe most important thing about AI 2040 is that it’s neither a forecast nor a set of recommendations, but rather something in between: an optimistic forecast. The key benefit of the optimistic forecast format is that it’s able to convey many details of good futures, showing us how they could all fit together. The key downside, however, is that it’s hard for readers to know which parts of the scenario the authors consider to be actively desirable, versus neutral, versus undesirable but included for the sake of realism.\n\nThe most obvious example of this issue is literally in the name. In their main recommendation, humanity hands over control of the world to AIs in 2040. Is this the best sc"
+        },
+        "user": {
+          "_id": "BCmzFRdQhqLPREvat",
+          "displayName": "Richard_Ngo",
+          "slug": "ricraz"
+        }
+      }
+    },
+    "comments": {
+      "results": [
+        {
+          "_id": "AXErk2XuNecu98pZq",
+          "parentCommentId": null,
+          "postedAt": "2026-07-10T19:27:45.986Z",
+          "contents": {
+            "plaintextMainText": "Re: von Neumann and preemptive war, I just want to note that:\n\n * Von Neumann never advocated for preemptive war against the USSR in any public writing. (As far as I can tell.)\n * I know of no private writing in which he advocated for it, either.\n * The only publicly available sources (that I know of) for von Neumann's opinion about preemptive war are:\n   * A short, uncited quote in his obituary.\n   * A single line from his wife's diary.\n   * His daughter's autobiography, which cites the obituary.\n\nIf you or anyone has more evidence about von Neumann's ideas about preemptive war with the USSR, I would love to know about it!"
+          },
+          "user": {
+            "_id": "sJv7yzCp5xfWBAPvG",
+            "displayName": "Nisan",
+            "slug": "nisan"
+          }
+        },
+        {
+          "_id": "yo6GqX7PfYymPxGRM",
+          "parentCommentId": null,
+          "postedAt": "2026-07-10T23:14:56.438Z",
+          "contents": {
+            "plaintextMainText": "I'm actually sympathetic to your criticisms, as you know from personal conversations. But I am very unsympathetic to this thing you say here about us buying uncritically into sharp takeoff of AI capabilities.\n\nFirst of all, I've made a lot of predictions about AI capabilities and their diffusion and effects on society over the past years -- going back at least to What 2026 Looks Like in 2021 -- more than almost anyone else. And I've been overall pretty accurate. It's true that W2026LL overestimated the impacts of some things -- most notably AI-powered persuasion -- but it's also true that I underestimated the impacts of other things, e.g. AI company revenue has grown faster than AI 2027 predicted and GDP growth contribution from AI has been more than W2026LL and AI 2027 predicted.\n\nAlso, isn't deploying AIs internally to accelerate AI R&D an example of a real-world impact? It's probably the most important kind of impact actually. And it sure is happening faster than almost everyone else expected and potentially faster than even I expected.\n\n\n\n"
+          },
+          "user": {
+            "_id": "YLFQfGzNdGA4NFcKS",
+            "displayName": "Daniel Kokotajlo",
+            "slug": "daniel-kokotajlo"
+          }
+        },
+        {
+          "_id": "nGqMonSqgmkncFLLq",
+          "parentCommentId": null,
+          "postedAt": "2026-07-09T22:44:31.377Z",
+          "contents": {
+            "plaintextMainText": "How confident are you in that statement?\n\nIf you told them something like \"AIs have an 80%-reliability time horizon of 3 hours on software engineering evaluation tasks in mid 2026 (and cross 1 hour in early 2026)\" I think they would have predicted something roughly like the current $100B of coding revenue from AI companies. And I don't think they would have predicted any of the outcomes you listed.\n\nI agree some other benchmarks that are more expertise-heavy (e.g. IMO math, MMLU, etc.) ended up saturated way faster than people expected, but I think that's just downstream of a mistake people made where they underestimated how easy it would be to build somewhat narrow systems that solve these sorts of small-horizon natural language problems, and not the symptom of a disconnect between measured capabilities and impact.\n\nMaybe a disconnect will exist in the future because measuring very long horizon capabilities on the tasks we care most about is difficult, but this feels more like \"people will suck at building good capabilities benchmarks\" than \"there will be a mysterious gap that deserves to be grappled with\"."
+          },
+          "user": {
+            "_id": "WX39xzenFzNxKZiCQ",
+            "displayName": "Fabien Roger",
+            "slug": "fabien-roger"
+          }
+        },
+        {
+          "_id": "SsibHXHrvFXbMwoKt",
+          "parentCommentId": "nGqMonSqgmkncFLLq",
+          "postedAt": "2026-07-10T00:35:37.837Z",
+          "contents": {
+            "plaintextMainText": "But the systems that are saturating IMO math, MMLU, etc, are not very narrow in the sense that people would have used the term a decade or two ago. So you can think about their mistake as the inability to imagine systems which have become much less narrow (to the extent that a single system can saturate almost all language and vision benchmarks from a decade ago) but are still far away from taking over the world. Then the question is: why not expect the same to happen over the next decade?"
+          },
+          "user": {
+            "_id": "BCmzFRdQhqLPREvat",
+            "displayName": "Richard_Ngo",
+            "slug": "ricraz"
+          }
+        },
+        {
+          "_id": "EBCvKWt58272EpPZj",
+          "parentCommentId": "AXErk2XuNecu98pZq",
+          "postedAt": "2026-07-11T13:49:33.724Z",
+          "contents": {
+            "plaintextMainText": "To be fair, I think the fact that both his wife and daughter thought he was in favor of preemptive war is pretty strong evidence that he was talking about it in private conversations."
+          },
+          "user": {
+            "_id": "kuvFG9nkuS8Wxo8pz",
+            "displayName": "David Matolcsi",
+            "slug": "david-matolcsi"
+          }
+        },
+        {
+          "_id": "LCcDAd9CD65bL7M5f",
+          "parentCommentId": null,
+          "postedAt": "2026-07-10T00:34:55.881Z",
+          "contents": {
+            "plaintextMainText": "How likely is it that the questions are actually covered in many Appendices like the one related to plausibility and desirability of various policies? Or that handoff in 2040 is explicitly covered in an entire collapsed section which links to an entire supplement related to capabilities scaling? My personal worry is that the forecast is overly optimistic, not under-optimistic."
+          },
+          "user": {
+            "_id": "T7QHMS7qNx3s7z36d",
+            "displayName": "StanislavKrym",
+            "slug": "stanislavkrym"
+          }
+        },
+        {
+          "_id": "nzG7FH9qeQgv7fcpf",
+          "parentCommentId": "yo6GqX7PfYymPxGRM",
+          "postedAt": "2026-07-11T13:36:01.044Z",
+          "contents": {
+            "plaintextMainText": "the \"divergence between capabilities and impacts' we observe, with specific reference to AI2027 predictions for example, seems to be that AI has turned out to be better aligned than we expected. Even with the rise of ~superhuman coder level AI, we've seen virtually no ill effects so far (a small uptick in crypto and ransomware attacks aside).\n\nI think progress in alignment research has not been adequately used to update your priors on RSI being most likely misaligned."
+          },
+          "user": {
+            "_id": "KzMw75vToT9pyNtEy",
+            "displayName": "Dhruv Mehrotra",
+            "slug": "dhruv-mehrotra"
+          }
+        },
+        {
+          "_id": "eCKo8ApBbuYdcwp6W",
+          "parentCommentId": "yo6GqX7PfYymPxGRM",
+          "postedAt": "2026-07-11T06:53:39.588Z",
+          "contents": {
+            "plaintextMainText": "(also there is the AI futures model and all the preceding attempts to model takeoff)"
+          },
+          "user": {
+            "_id": "YLFQfGzNdGA4NFcKS",
+            "displayName": "Daniel Kokotajlo",
+            "slug": "daniel-kokotajlo"
+          }
+        },
+        {
+          "_id": "xcXmf2A2vxDmxqjLZ",
+          "parentCommentId": "yo6GqX7PfYymPxGRM",
+          "postedAt": "2026-07-11T06:11:53.824Z",
+          "contents": {
+            "plaintextMainText": "I think your forecasting has been absolutely stellar, but surely you can do a forecast on how likely this wishlist scenario is, and would arrive at a number too low to even seem worth thinking about it, no? Even imagining the ultrarational US administration required should be too low to think about, let alone when you add all of the rest.\n\nIt seems like even a super basic 'We use all the might we can gather to convince one by one all the biggest actors seperately to delay and put more into Safety, and do lesser more plausible regulations that incentivize using more of their compute towards Safety in a way all labs benefit from' or some slightly improved version looks significantly more plausible, no? (still not very plausible, maybe not as pie in the sky at least but still pie in the troposphere).\n\nOr better yet, is there by any chance a realistic plan that you are about to follow-up AI 2040 with?\n\n\nEdit: I guess you've already outlined your Plan B and it's already 'Fight China'.."
+          },
+          "user": {
+            "_id": "CRSZPEg9dHyMspTzN",
+            "displayName": "Tenoke",
+            "slug": "tenoke"
+          }
+        },
+        {
+          "_id": "Q5JrGcrdanvtyKipc",
+          "parentCommentId": "cbWvtcWQFJnuiSScj",
+          "postedAt": "2026-07-11T13:20:14.408Z",
+          "contents": {
+            "plaintextMainText": "I don’t think those questions depend on one another.  We should govern powerful AI systems whether or not they possess welfare.  We already regulate many technologies that have no welfare at all.  My point is about a different question: when, if ever, does an AI become the kind of thing to which governance is owed, rather than merely applied?  Capability alone doesn’t answer that.  "
+          },
+          "user": {
+            "_id": "t9xmqoJRFCJmjZkLm",
+            "displayName": "stewart leland jansen",
+            "slug": "stewart-leland-jansen"
+          }
+        },
+        {
+          "_id": "Z2ccu6jpK7h3CFz8T",
+          "parentCommentId": null,
+          "postedAt": "2026-07-10T11:49:47.639Z",
+          "contents": {
+            "plaintextMainText": "Are you classifying the Vietnam war as a domestic issue?"
+          },
+          "user": {
+            "_id": "cXAGJNRJvoBsfDNMB",
+            "displayName": "Ninety-Three",
+            "slug": "ninety-three"
+          }
+        },
+        {
+          "_id": "cbWvtcWQFJnuiSScj",
+          "parentCommentId": "EtRaSi9WYq26KnMZJ",
+          "postedAt": "2026-07-09T21:37:40.076Z",
+          "contents": {
+            "plaintextMainText": "Suppose that the AIs LACK welfare. Then how would we punt on AI GOVERNANCE which is supposed to establish what mankind or whoever concentrates power will ORDER the AIs to do and how to ensure that power isn't concentrated?"
+          },
+          "user": {
+            "_id": "T7QHMS7qNx3s7z36d",
+            "displayName": "StanislavKrym",
+            "slug": "stanislavkrym"
+          }
+        },
+        {
+          "_id": "EtRaSi9WYq26KnMZJ",
+          "parentCommentId": null,
+          "postedAt": "2026-07-09T21:34:47.613Z",
+          "contents": {
+            "plaintextMainText": "Before asking when—or whether—we should hand over authority to AI systems, I wonder if there’s a more fundamental distinction that needs to be made between functional continuity and participatory continuity.  \n\nAI2040 largely assumes that increasingly capable systems naturally move us toward questions of welfare, standing, and eventually delegated authority.  I’m not convinced those questions even become meaningful until we know whether anything is actually carried by the continuing system. \n\nA model can preserve capabilities across updates while remaining entirely replaceable.  That’s different from asking whether consequences accumulate in a way that becomes non-detachable from the system’s own continuation.  \n\nI suspect that’s a prerequisite question.  If we get it wrong, we’ll spend years debating AI welfare and governance before we’ve established what, if anything, could actually possess either.  Victor Wyld’s Scrutinized Awareness Theory argues that consciousness, welfare, and standing cannot be evaluated solely in terms of functional capability or behavioral competence, but require distinguishing systems that merely continue to function from systems that become participants in their own continuing history.  If that distinction is sound, it belongs near the beginning of this conversation rather than the end—before we start talking about handing anything the keys.  "
+          },
+          "user": {
+            "_id": "t9xmqoJRFCJmjZkLm",
+            "displayName": "stewart leland jansen",
+            "slug": "stewart-leland-jansen"
+          }
+        }
+      ]
+    }
+  }
+}

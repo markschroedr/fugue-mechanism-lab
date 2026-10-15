@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+skill_source="${1:-/usr/local/share/sandbox/pi-skills}"
+agent_source="${2:-/usr/local/share/sandbox/pi-agents}"
+
+apk add --no-cache npm
+pi=/home/coder/.bun/bin/pi
+[ -x "$pi" ] || { echo 'sandbox: Pi is not installed' >&2; exit 1; }
+if ! su - coder -c "$pi list" | grep -q 'npm:pi-subagents'; then
+  su - coder -c "$pi install npm:pi-subagents"
+fi
+
+install -d -m 0755 -o coder -g coder /home/coder/.pi/agent/skills
+cp -R "$skill_source"/. /home/coder/.pi/agent/skills/
+chown -R coder:coder /home/coder/.pi/agent/skills
+install -d -m 0755 -o coder -g coder /home/coder/.pi/agent/agents
+cp -R "$agent_source"/. /home/coder/.pi/agent/agents/
+chown -R coder:coder /home/coder/.pi/agent/agents
+
+settings=/home/coder/.pi/agent/settings.json
+[ -f "$settings" ] || printf '{}\n' > "$settings"
+jq '.subagents = ((.subagents // {}) + {
+  "defaultModel": "openai-codex/gpt-5.6-sol",
+  "maxSubagentDepth": 1,
+  "agentOverrides": ((.subagents.agentOverrides // {}) + {
+    "scout": {"disabled": true},
+    "researcher": {"disabled": true},
+    "context-builder": {"disabled": true},
+    "oracle": {"disabled": true},
+    "planner": {"disabled": true},
+    "reviewer": {"disabled": true},
+    "worker": {"disabled": true},
+    "delegate": {"disabled": true}
+  })
+})' "$settings" > "$settings.tmp"
+mv "$settings.tmp" "$settings"
+chown coder:coder "$settings"
+chmod 0600 "$settings"
+
+echo 'sandbox: Pi read-only subagent policy installed'

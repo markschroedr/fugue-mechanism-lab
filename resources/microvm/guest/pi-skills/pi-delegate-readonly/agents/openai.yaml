@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi Read-only Delegation"
+  short_description: "Delegate exploration and review without edits"
+  default_prompt: "Use $pi-delegate-readonly to delegate exploration or review while keeping implementation in the parent agent."

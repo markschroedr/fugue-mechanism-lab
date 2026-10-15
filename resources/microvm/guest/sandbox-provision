@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+echo "sandbox: installing base development environment"
+apk update
+apk add --no-cache bash build-base ca-certificates curl git jq nftables nodejs npm openssh-client python3 sudo tzdata
+
+if ! id coder >/dev/null 2>&1; then
+  addgroup -g 1000 coder
+  adduser -D -u 1000 -G coder -s /bin/bash coder
+fi
+addgroup coder wheel
+install -d -m 0755 -o coder -g coder /home/coder/project
+printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/wheel
+chmod 0440 /etc/sudoers.d/wheel
+
+cat > /home/coder/.bash_profile <<'EOF'
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+if [[ -f "$HOME/.config/sandbox/env.sh" ]]; then
+  set -a
+  source "$HOME/.config/sandbox/env.sh"
+  set +a
+fi
+cd "$HOME/project"
+EOF
+chown coder:coder /home/coder/.bash_profile
+
+su - coder -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+su - coder -c 'curl -fsSL https://bun.sh/install | bash'
+su - coder -c '$HOME/.bun/bin/bun add --global --ignore-scripts @earendil-works/pi-coding-agent'
+/usr/local/sbin/setup-pi-subagents
+ln -sf /home/coder/.local/bin/uv /usr/local/bin/uv
+ln -sf /home/coder/.local/bin/uvx /usr/local/bin/uvx
+ln -sf /home/coder/.bun/bin/bun /usr/local/bin/bun
+ln -sf /home/coder/.bun/bin/pi /usr/local/bin/pi
+
+touch /etc/sandbox-provisioned
+echo "sandbox: base environment ready"

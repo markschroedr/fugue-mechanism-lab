@@ -96,7 +96,7 @@ function readConfig(path: string): FugueToml {
   if (root.society !== undefined) {
     const society = requiredTable("society", root.society);
     assertExactKeys("society", society, [
-      "instance_id", "mission", "treasury_address", "weekly_allowance", "compute_backing", "shared_daily_line",
+      "world", "instrumentation", "instance_id", "mission", "treasury_address", "weekly_allowance", "compute_backing", "shared_daily_line",
       "guest_api_url", "kit_dir", "sandbox_bin", "runner", "models"
     ]);
     const runner = requiredTable("society.runner", society.runner);

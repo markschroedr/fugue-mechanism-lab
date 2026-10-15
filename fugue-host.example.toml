@@ -1,0 +1,10 @@
+experiments_dir = "/absolute/path/to/fugue/experiments"
+secrets_dir = "/absolute/path/to/fugue/secrets"
+logs_dir = "/absolute/path/to/fugue/logs"
+gateways_dir = "/absolute/path/to/fugue/gateways"
+vm_bridge_host = "192.168.64.1"
+sandbox_bin = "/absolute/path/to/microvm-sandbox/sandbox"
+# Explicitly authorized, same-host Codex source; only its access token enters guests.
+codex_auth_file = "/absolute/path/to/authorized/codex/auth.json"
+server_bin = "/absolute/path/to/fugue-server"
+caddy_bin = "/absolute/path/to/caddy"

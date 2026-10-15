@@ -18,12 +18,24 @@ from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-USED_PERCENT_RE = re.compile(r'"used_percent"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
 DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)([smhd])$")
 EFFORTS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+class DeadlineReached(RuntimeError):
+    pass
+
+
+def hard_stop_epoch(value: str | None) -> float | None:
+    if value is None:
+        return None
+    deadline = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if deadline.tzinfo is None:
+        raise ValueError("hard_stop_at must include a timezone")
+    return deadline.timestamp()
 
 
 class ApiRequestError(RuntimeError):
@@ -104,6 +116,10 @@ class Runner:
         self.runner_config = self.node.get("runner")
         if not isinstance(self.runner_config, dict):
             raise RuntimeError("node.json must contain runner configuration")
+        deadlines = [hard_stop_epoch(value) for value in (
+            self.runner_config.get("hardStopAt"), os.environ.get("ROBINSON_HARD_STOP_AT")
+        ) if value is not None]
+        self.hard_stop_at = min(deadlines) if deadlines else None
         self.models = self.rates.get("models")
         if not isinstance(self.models, dict):
             raise RuntimeError("rates.json must contain models")
@@ -119,11 +135,22 @@ class Runner:
         self.wake_message_path = self.home / "wake-up.md"
         self.sessions_dir = self.home / "sessions"
         self.log_path = self.home / "robinson.log"
+        self.quota_window_path = self.home / ".robinson-quota-window.json"
         self._prepare_home()
 
     def _prepare_home(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        project_settings = self.home / ".pi" / "settings.json"
+        if not project_settings.exists():
+            project_settings.parent.mkdir(parents=True, exist_ok=True)
+            project_settings.write_text(compact({
+                "compaction": {
+                    "enabled": True,
+                    "reserveTokens": 16384,
+                    "keepRecentTokens": 20000,
+                }
+            }) + "\n", encoding="utf-8")
         fugue_dir = self.home / ".fugue"
         fugue_dir.mkdir(exist_ok=True)
         (fugue_dir / "agent.key").write_text(self.key + "\n", encoding="utf-8")
@@ -142,6 +169,27 @@ class Runner:
             self._run_quiet(["git", "config", "user.name", "Robinson Runner"], check=True)
             self._run_quiet(["git", "config", "user.email", "robinson@localhost"], check=True)
 
+        # Keep mutable executor state and reproducible toolchains out of each
+        # wake's Git history. Snapshot exports still preserve sessions and state.
+        exclude = self.home / ".git/info/exclude"
+        if exclude.parent.is_dir():
+            patterns = [
+                "/sessions/", "/.pi/agent/", "/.bun/", "/.cache/", "/.npm/",
+                "/.rustup/", "/.cargo/registry/", "/.cargo/git/", "/.local/bin/uv",
+                "/.local/bin/uvx", "/.fugue/agent.key", "/society/agent.key",
+                "/.robinson-*.json", "/robinson.log", "/wake-up.md",
+                "__pycache__/",
+            ]
+            current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            missing = [pattern for pattern in patterns if pattern not in current.splitlines()]
+            if missing:
+                with exclude.open("a", encoding="utf-8") as target:
+                    target.write("\n" + "\n".join(missing) + "\n")
+
+    def check_deadline(self) -> None:
+        if self.hard_stop_at is not None and time.time() >= self.hard_stop_at:
+            raise DeadlineReached("experiment hard stop reached")
+
     def env(self, compute_backing: str | None = None) -> dict[str, str]:
         env = dict(os.environ)
         env["HOME"] = str(self.home)
@@ -150,14 +198,15 @@ class Runner:
         env["PATH"] = str(self.home / ".local" / "bin") + os.pathsep + env.get("PATH", "")
         env["ROBINSON_SLEEP_FILE"] = str(self.sleep_path)
         env["ROBINSON_MAX_SLEEP_SECONDS"] = f"{self.max_sleep_seconds():g}"
+        env["ROBINSON_MODELS"] = json.dumps(list(self.models))
         if compute_backing is not None:
             env["ROBINSON_COMPUTE_BACKING"] = compute_backing
         return env
 
     def max_sleep_seconds(self) -> float:
         value = float(self.runner_config.get("maxSleepSeconds", 300))
-        if not math.isfinite(value) or value <= 0:
-            raise RuntimeError("maxSleepSeconds must be positive")
+        if not math.isfinite(value) or value < 0:
+            raise RuntimeError("maxSleepSeconds must be nonnegative")
         return value
 
     def api(self, method: str, path: str, body: Any | None = None) -> Any:
@@ -179,6 +228,7 @@ class Runner:
     def run(self) -> int:
         completed_here = 0
         while self.max_wakes is None or completed_here < self.max_wakes:
+            self.check_deadline()
             state = read_json(self.state_path, {})
             if not isinstance(state, dict):
                 state = {}
@@ -206,17 +256,22 @@ class Runner:
                 if "settlement" not in progress:
                     termination = "host_outage"
             else:
+                if context.get("episode", {}).get("ended"):
+                    self.log("halted: worker has ended")
+                    return 0
                 if compute_backing == "obols" and balance < 1:
                     self.log("halted: balance cannot cover a minimum wake")
                     return 0
-                self.wait_for_quota()
+                if not self.wait_for_quota():
+                    return 75
                 wake_number = int(state.get("lastWakeNumber", 0)) + 1
                 plan = self.plan_for_wake(state)
-                session_path = self.sessions_dir / f"wake-{wake_number:06d}.jsonl"
+                session_path = self.session_path(state)
                 progress = {
                     "wakeNumber": wake_number,
                     "plan": plan,
                     "session": str(session_path),
+                    "sessionStartOffset": session_path.stat().st_size if session_path.exists() else 0,
                     "startedAt": time.time(),
                     "stage": "prepared",
                 }
@@ -239,18 +294,30 @@ class Runner:
                     progress.pop("permit", None)
                     atomic_json(self.in_progress_path, progress)
                     termination = self.execute_wake(
-                        session_path, plan, balance, compute_backing, wake_number, permit
+                        session_path,
+                        int(progress.get("sessionStartOffset", 0)),
+                        plan,
+                        balance,
+                        compute_backing,
+                        wake_number,
+                        permit,
                     )
                 finally:
                     self.release_wake_permit(wake_number, permit["token"])
                 progress["termination"] = termination
+                progress["sessionEndOffset"] = session_path.stat().st_size if session_path.exists() else 0
+                atomic_json(self.in_progress_path, progress)
             elif recovered:
                 permit = progress.get("permit")
                 if isinstance(permit, dict) and isinstance(permit.get("token"), str):
                     self.release_wake_permit(wake_number, permit["token"])
             settlement = progress.get("settlement")
             if not isinstance(settlement, dict):
-                usage = meter_session(session_path)
+                usage = meter_session(
+                    session_path,
+                    int(progress.get("sessionStartOffset", 0)),
+                    int(progress.get("sessionEndOffset", session_path.stat().st_size if session_path.exists() else 0)),
+                )
                 cost_usd = price_usage(usage, self.model_rate(plan["model"]))
                 priced_debit = 0 if not has_usage(usage) else max(
                     1, int((cost_usd * 100).to_integral_value(rounding=ROUND_CEILING))
@@ -289,7 +356,12 @@ class Runner:
             if crash_marker and not Path(crash_marker).exists():
                 Path(crash_marker).write_text("crashed\n", encoding="utf-8")
                 os._exit(86)
-            self.record_wake_transcript(session_path, wake_number)
+            self.record_wake_transcript(
+                session_path,
+                wake_number,
+                int(progress.get("sessionStartOffset", 0)),
+                int(progress.get("sessionEndOffset", session_path.stat().st_size if session_path.exists() else 0)),
+            )
             if termination == "executor_failure" and not recovered:
                 raise RuntimeError(f"executor failed during wake {wake_number}; restart the runner to recover")
             sleep_request = self.read_sleep_request()
@@ -319,6 +391,7 @@ class Runner:
                 "chosenSleepSeconds": chosen_sleep,
                 "scheduledSleepSeconds": next_due_at - ended_at,
                 "nextDueAt": next_due_at,
+                "sessionPath": str(session_path),
             }
             progress["nextState"] = state
             atomic_json(self.in_progress_path, progress)
@@ -349,6 +422,22 @@ class Runner:
         self.compose_wake_message(context, state, wake_number, plan)
         return self.wake_message_path.read_text(encoding="utf-8")
 
+    def session_path(self, state: dict[str, Any]) -> Path:
+        stored = state.get("sessionPath")
+        if isinstance(stored, str):
+            candidate = Path(stored)
+            try:
+                candidate.resolve().relative_to(self.sessions_dir)
+            except ValueError as error:
+                raise RuntimeError("stored session path escapes the sessions directory") from error
+            return candidate
+        last_wake = state.get("lastWakeNumber")
+        if isinstance(last_wake, int) and last_wake > 0:
+            legacy = self.sessions_dir / f"wake-{last_wake:06d}.jsonl"
+            if legacy.is_file():
+                return legacy
+        return self.sessions_dir / "session.jsonl"
+
     def wait_for_schedule(self, state: dict[str, Any]) -> None:
         now = time.time()
         due_at = float(state.get("nextDueAt", now))
@@ -357,6 +446,7 @@ class Runner:
             self.log(f"next wake scheduled for {dt.datetime.fromtimestamp(due_at).astimezone().isoformat()}")
         wake_number = state.get("lastWakeNumber")
         while due_at > time.time():
+            self.check_deadline()
             try:
                 lifecycle = self.api("GET", "/api/society/wakes/status")
                 if (
@@ -402,6 +492,7 @@ class Runner:
 
     def acquire_wake_permit(self, wake_number: int) -> dict[str, Any]:
         while True:
+            self.check_deadline()
             try:
                 permit = self.api(
                     "POST",
@@ -491,6 +582,17 @@ class Runner:
         return rate
 
     def compose_wake_message(self, context: dict[str, Any], state: dict[str, Any], wake_number: int, plan: dict[str, Any]) -> None:
+        renderer = self.node.get("worldWakeRenderer")
+        if renderer:
+            import runpy
+            try:
+                note = self.note_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                note = "none"
+            render = runpy.run_path(str(self.kit / renderer))["render"]
+            text = render(context, state, wake_number, plan, note, self.address)
+            self.wake_message_path.write_text(text, encoding="utf-8")
+            return
         now = dt.datetime.now().astimezone()
         compute_backing = required_compute_backing(context)
         budget = context["budget"]
@@ -595,6 +697,7 @@ class Runner:
     def execute_wake(
         self,
         session_path: Path,
+        session_start_offset: int,
         plan: dict[str, Any],
         balance: int,
         compute_backing: str,
@@ -607,6 +710,7 @@ class Runner:
         command = [
             executor,
             "-p",
+            "--approve",
             "--session",
             str(session_path),
             "--model",
@@ -615,11 +719,13 @@ class Runner:
             plan["effort"],
             "--extension",
             str(self.kit / "sleep.ts"),
-            "@" + str(self.kit / "SPAWN.md"),
-            "@" + str(self.wake_message_path),
-            "@" + str(self.kit / "SKILL-society-node.md"),
-            "Begin this wake.",
         ]
+        if session_start_offset == 0:
+            command.extend([
+                "@" + str(self.kit / "SPAWN.md"),
+                "@" + str(self.kit / "SKILL-society-node.md"),
+            ])
+        command.extend(["@" + str(self.wake_message_path), "Begin this wake."])
         output_path = self.sessions_dir / (session_path.stem + "-executor.log")
         requested_cap = plan["capObols"]
         if compute_backing == "obols":
@@ -630,17 +736,52 @@ class Runner:
         started = time.monotonic()
         lease_expires_at = float(permit["leaseExpiresAt"])
         heartbeat_at = time.monotonic() + 30
+        quota_check_at = time.monotonic() + 30
+        tool_offset = session_start_offset
+
+        def stream_tools():
+            nonlocal tool_offset
+            if not session_path.exists():
+                return
+            with session_path.open("rb") as source:
+                source.seek(tool_offset)
+                while line := source.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    tool_offset = source.tell()
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    message = record.get("message", {})
+                    if message.get("role") != "assistant":
+                        continue
+                    for block in message.get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "toolCall":
+                            print("fugue-tool " + json.dumps({
+                                "time": time.time(), "wake": wake_number,
+                                "tool": block.get("name"), "arguments": block.get("arguments"),
+                            }, separators=(",", ":")), flush=True)
+
         with output_path.open("ab") as output:
+            process_env = self.env(compute_backing)
+            process_env["ROBINSON_WAKE_NUMBER"] = str(wake_number)
+            self.check_deadline()
             process = subprocess.Popen(
                 command,
                 cwd=self.home,
-                env=self.env(compute_backing),
+                env=process_env,
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
             while process.poll() is None:
-                usage = meter_session(session_path)
+                if self.hard_stop_at is not None and time.time() >= self.hard_stop_at:
+                    termination = "hard_stop"
+                    terminate_group(process)
+                    break
+                stream_tools()
+                usage = meter_session(session_path, session_start_offset)
                 cost = price_usage(usage, rate)
                 projected = 0 if not has_usage(usage) else max(
                     1, int((cost * 100).to_integral_value(rounding=ROUND_CEILING))
@@ -664,12 +805,27 @@ class Runner:
                     termination = "wall_timeout"
                     terminate_group(process)
                     break
+                if bool(self.runner_config.get("quotaProbe", True)) and time.monotonic() >= quota_check_at:
+                    try:
+                        quota_available = self.quota_available()
+                    except (OSError, ValueError, RuntimeError, URLError) as error:
+                        self.log(f"quota unavailable; stopping executor: {error}")
+                        quota_available = False
+                    if not quota_available:
+                        termination = "quota"
+                        terminate_group(process)
+                        break
+                    quota_check_at = time.monotonic() + 30
                 if time.monotonic() >= heartbeat_at:
                     try:
                         permit = self.heartbeat_wake_permit(wake_number, permit["token"])
                         lease_expires_at = float(permit["leaseExpiresAt"])
                         heartbeat_at = time.monotonic() + 30
                     except Exception as error:
+                        if isinstance(error, ApiRequestError) and error.status == 401:
+                            termination = "worker_ended"
+                            terminate_group(process)
+                            break
                         if time.time() + 10 >= lease_expires_at:
                             self.log(f"wake permit heartbeat failed: {error}")
                             termination = "wake_permit"
@@ -678,6 +834,7 @@ class Runner:
                         heartbeat_at = time.monotonic() + 5
                 time.sleep(float(self.runner_config["pollSeconds"]))
             exit_code = process.wait()
+            stream_tools()
         if exit_code != 0 and termination == "stopped":
             return "executor_failure"
         return termination
@@ -705,8 +862,10 @@ class Runner:
             raise RuntimeError("wake debit response is invalid")
         return int(receipt["pricedObols"]), int(receipt["chargedObols"])
 
-    def record_wake_transcript(self, session_path: Path, wake_number: int) -> None:
-        session_bytes = session_path.read_bytes() if session_path.exists() else b""
+    def record_wake_transcript(
+        self, session_path: Path, wake_number: int, start_offset: int, end_offset: int
+    ) -> None:
+        session_bytes = read_session_segment(session_path, start_offset, end_offset)
         self.api("POST", "/api/society/wakes/transcript", {
             "agentAddress": self.address,
             "wakeNumber": wake_number,
@@ -740,32 +899,61 @@ class Runner:
         }
 
     def scoop_commit(self, wake_number: int) -> None:
-        self._run_quiet(["git", "add", "-A"], check=True)
+        exclusions = []
+        for parent, directories, files in os.walk(self.home):
+            root = Path(parent)
+            for name in directories[:]:
+                directory = root / name
+                relative = directory.relative_to(self.home).as_posix()
+                if relative in {".git", ".bun", ".cache", ".npm", ".rustup", ".cargo", ".pi/agent", "sessions"}:
+                    directories.remove(name)
+                    continue
+                reproducible = (
+                    name == "target" and {"Cargo.toml", "Cargo.lock"}.issubset(files)
+                    or name == "node_modules" and "package.json" in files
+                    and any(lock in files for lock in ("bun.lock", "bun.lockb", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"))
+                    or name == ".venv" and (directory / "pyvenv.cfg").is_file()
+                    and any(lock in files for lock in ("uv.lock", "requirements.txt"))
+                )
+                if reproducible and not directory.is_symlink():
+                    exclusions.append(":(exclude,literal)" + relative + "/")
+                    directories.remove(name)
+        self._run_quiet(["git", "add", "-A", "--", ".", *exclusions], check=True)
         status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=self.home, env=self.env(),
+            ["git", "diff", "--cached", "--name-only"], cwd=self.home, env=self.env(),
             capture_output=True, text=True, check=True,
         ).stdout
         if status:
             self._run_quiet(["git", "commit", "-q", "-m", f"Wake {wake_number} sleep boundary"], check=True)
 
-    def wait_for_quota(self) -> None:
+    def quota_available(self) -> bool:
+        quota = read_codex_quota(self.home)
+        window = read_json(self.quota_window_path)
+        if window is None:
+            window = {"resetAt": quota["weeklyResetAt"]}
+            atomic_json(self.quota_window_path, window)
+        if not isinstance(window, dict):
+            raise RuntimeError("invalid recorded quota window")
+        if window.get("resetAt") != quota["weeklyResetAt"]:
+            self.log("quota window changed; experiment needs operator rearming")
+            return False
+        available = quota["allowed"] and quota["weeklyUsedPercent"] < float(self.runner_config["quotaThresholdPercent"])
+        if not available:
+            self.log(f"quota at {quota['weeklyUsedPercent']:g}% weekly used; pausing")
+        return available
+
+    def wait_for_quota(self) -> bool:
         if not bool(self.runner_config.get("quotaProbe", True)):
-            return
-        threshold = float(self.runner_config["quotaThresholdPercent"])
+            return True
         while True:
-            command = self.runner_config.get("quotaProbeCommand", [
-                "codex", "exec", "--skip-git-repo-check", "Reply with exactly: ok"
-            ])
-            if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-                raise RuntimeError("quotaProbeCommand must be a string array")
+            self.check_deadline()
             try:
-                subprocess.run(command, cwd=self.home, env=self.env(), capture_output=True, timeout=120, check=False)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            used = latest_codex_used_percent(self.home)
-            if used is None or used < threshold:
-                return
-            self.log(f"quota at {used:.1f}%; pausing before next wake")
+                if self.quota_available():
+                    return True
+            except (OSError, ValueError, RuntimeError, URLError) as error:
+                self.log(f"quota unavailable; wake remains paused: {error}")
+            if self.max_wakes == 1:
+                return False
             time.sleep(float(self.runner_config["quotaPauseSeconds"]))
 
     def _run_quiet(self, command: list[str], check: bool) -> subprocess.CompletedProcess[bytes]:
@@ -778,7 +966,18 @@ class Runner:
         print(message, flush=True)
 
 
-def meter_session(path: Path) -> dict[str, int]:
+def read_session_segment(path: Path, start_offset: int = 0, end_offset: int | None = None) -> bytes:
+    if start_offset < 0 or (end_offset is not None and end_offset < start_offset):
+        raise RuntimeError("session transcript offsets are invalid")
+    try:
+        with path.open("rb") as source:
+            source.seek(start_offset)
+            return source.read() if end_offset is None else source.read(end_offset - start_offset)
+    except FileNotFoundError:
+        return b""
+
+
+def meter_session(path: Path, start_offset: int = 0, end_offset: int | None = None) -> dict[str, int]:
     totals = {
         "inputTokens": 0,
         "cachedInputTokens": 0,
@@ -786,19 +985,23 @@ def meter_session(path: Path) -> dict[str, int]:
         "outputTokens": 0,
         "reasoningOutputTokens": 0,
     }
-    try:
-        data = path.read_bytes()
-    except FileNotFoundError:
-        return totals
+    data = read_session_segment(path, start_offset, end_offset)
     for raw_line in data.splitlines():
         try:
             entry = json.loads(raw_line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        message = entry.get("message") if isinstance(entry, dict) and entry.get("type") == "message" else None
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(entry, dict):
             continue
-        usage = message.get("usage")
+        if entry.get("type") == "message":
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") not in {"assistant", "toolResult"}:
+                continue
+            usage = message.get("usage")
+        elif entry.get("type") in {"compaction", "branch_summary"}:
+            usage = entry.get("usage")
+        else:
+            continue
         if not isinstance(usage, dict):
             continue
         for source, target in [
@@ -831,17 +1034,40 @@ def price_usage(usage: dict[str, int], rate: dict[str, Any]) -> Decimal:
     return total
 
 
-def latest_codex_used_percent(home: Path) -> float | None:
-    codex_home = Path(os.environ.get("CODEX_HOME", str(home / ".codex")))
-    sessions = codex_home / "sessions"
-    if not sessions.is_dir():
+class NoQuotaRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
-    files = sorted(sessions.glob("**/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for path in files[:5]:
-        matches = USED_PERCENT_RE.findall(path.read_text(errors="replace"))
-        if matches:
-            return float(matches[-1])
-    return None
+
+
+def read_codex_quota(home: Path) -> dict[str, Any]:
+    """Read subscription limits without inference or credential refresh."""
+    auth_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", str(home / ".pi/agent")))
+    auth = read_json(auth_dir / "auth.json", {})
+    credential = auth.get("openai-codex", {}) if isinstance(auth, dict) else {}
+    if not isinstance(credential, dict):
+        raise RuntimeError("invalid dedicated Pi Codex credential")
+    access = credential.get("access")
+    account = credential.get("accountId")
+    if credential.get("type") != "oauth" or not isinstance(access, str) or not access:
+        raise RuntimeError("Pi Codex subscription credential is unavailable")
+    headers = {"Authorization": "Bearer " + access, "Accept": "application/json", "originator": "codex_cli_rs"}
+    if isinstance(account, str) and account:
+        headers["ChatGPT-Account-Id"] = account
+    request = Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+    with build_opener(NoQuotaRedirect()).open(request, timeout=20) as response:
+        payload = json.load(response)
+    limits = payload.get("rate_limit", {}) if isinstance(payload, dict) else {}
+    if not isinstance(limits, dict):
+        raise RuntimeError("provider returned invalid quota limits")
+    weekly = next((w for w in (limits.get("primary_window"), limits.get("secondary_window"))
+                   if isinstance(w, dict) and w.get("limit_window_seconds") == 604800), None)
+    if weekly is None:
+        raise RuntimeError("provider returned no weekly quota window")
+    used, reset = weekly.get("used_percent"), weekly.get("reset_at")
+    if type(used) not in (int, float) or not math.isfinite(used) or not 0 <= used <= 100 or type(reset) is not int:
+        raise RuntimeError("provider returned invalid weekly quota")
+    return {"weeklyUsedPercent": used, "weeklyResetAt": reset,
+            "allowed": limits.get("allowed") is True and limits.get("limit_reached") is False}
 
 
 def terminate_group(process: subprocess.Popen[Any]) -> None:
@@ -890,7 +1116,11 @@ def main() -> int:
     if args.preview_wake:
         sys.stdout.write(runner.preview_wake())
         return 0
-    return runner.run()
+    try:
+        return runner.run()
+    except DeadlineReached:
+        runner.log("halted: experiment hard stop reached")
+        return 0
 
 
 if __name__ == "__main__":

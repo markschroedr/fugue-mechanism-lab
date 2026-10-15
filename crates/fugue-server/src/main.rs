@@ -39,6 +39,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 mod config;
 mod context;
+mod world;
 
 use config::{FugueConfig, LlmConfig, SocietyConfig};
 
@@ -51,6 +52,8 @@ struct AppState {
     forum_magnum_endpoint: String,
     substrate_key_hash: Option<String>,
     society: SocietyConfig,
+    world_run_id: String,
+    world: Arc<world::WorldBundle>,
     wake_gate: Arc<WakeGate>,
     objection_rate_limit: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
 }
@@ -109,7 +112,11 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
+    let world = Arc::new(world::WorldBundle::load(&config.society.world)?);
+    let world_run_id = world.record_run(&store, &config.society)?;
     let state = AppState {
+        world_run_id,
+        world,
         store: Arc::new(store),
         api_host: config.api.host,
         llm,
@@ -162,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/society/agents", post(create_society_agent))
         .route("/api/society/birth", post(birth_society_agent))
         .route("/api/society/allowance", post(grant_society_allowance))
+        .route("/api/society/world-evidence", get(world::evidence))
         .route(
             "/api/society/agents/{address}/wake",
             post(request_society_wake),
@@ -181,6 +189,13 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(from_fn_with_state(state.clone(), require_substrate_auth));
 
     let society_protected = Router::new()
+        .route("/api/world/scorer", get(world::scorer))
+        .route("/api/world/submissions", post(world::submit))
+        .route("/api/world/leaderboard", get(world::leaderboard))
+        .route(
+            "/api/world/maintenance/{operation}",
+            post(world::maintenance),
+        )
         .route("/api/society/me", get(read_society_identity))
         .route("/api/society/budget", get(read_society_budget))
         .route("/api/society/wake-context", get(read_society_wake_context))
@@ -223,7 +238,12 @@ async fn main() -> anyhow::Result<()> {
             post(execute_escrow),
         )
         .route("/api/board/spaces", post(create_board_space))
-        .route("/api/board/posts", post(create_board_post))
+        .route(
+            "/api/board/posts",
+            post(create_board_post).layer(axum::extract::DefaultBodyLimit::max(
+                fugue_store::MAX_BOARD_POST_REQUEST_BYTES,
+            )),
+        )
         .route("/api/board/inbox", get(read_board_inbox))
         .route("/api/board/spaces/{space_id}/posts", get(read_board_feed))
         .route(
@@ -243,14 +263,6 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             require_local_or_substrate_auth,
         ));
-
-    let ui_origins = [config.ui.port, config.ui.preview_port]
-        .into_iter()
-        .map(|port| {
-            format!("http://{}", SocketAddr::new(config.ui.host, port))
-                .parse::<axum::http::HeaderValue>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -295,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone())
         .layer(
             CorsLayer::new()
-                .allow_origin(ui_origins)
+                .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         );
@@ -424,6 +436,9 @@ async fn birth_society_agent(
 async fn grant_society_allowance(
     State(state): State<AppState>,
 ) -> Result<Json<fugue_store::AllowanceGrantResult>, ApiError> {
+    if !state.world.policy.features().allowance_refill {
+        return Err(StoreError::Validation("periodic top-up unavailable".into()).into());
+    }
     Ok(Json(state.store.grant_weekly_allowances(
         state.society.weekly_allowance,
         &state.society.treasury_address,
@@ -446,7 +461,7 @@ async fn record_society_wake_started(
     Ok(Json(state.store.record_society_wake_started(
         &actor.actor_id,
         input.wake_number,
-        state.society.compute_backing == fugue_store::SocietyComputeBacking::Obols,
+        state.world.compute_backing(&state.society) == fugue_store::SocietyComputeBacking::Obols,
     )?))
 }
 
@@ -496,7 +511,7 @@ async fn read_society_budget(
 async fn read_society_wake_context(
     State(state): State<AppState>,
     Extension(actor): Extension<SocietyActor>,
-) -> Result<Json<fugue_store::SocietyWakeContext>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let inbox = state.store.read_board_inbox(&actor.actor_id)?;
     let paid_posts = inbox
         .iter()
@@ -507,8 +522,8 @@ async fn read_society_wake_context(
             attached_obols: post.attached_obols,
         })
         .collect();
-    Ok(Json(fugue_store::SocietyWakeContext {
-        compute_backing: state.society.compute_backing,
+    let mut context = serde_json::to_value(fugue_store::SocietyWakeContext {
+        compute_backing: state.world.compute_backing(&state.society),
         budget: state
             .store
             .read_society_budget(&actor.actor_id, &state.society.treasury_address)?,
@@ -518,7 +533,17 @@ async fn read_society_wake_context(
             .unwrap_or_else(|| state.society.shared_daily_line.clone()),
         unread_count: i64::try_from(inbox.len()).map_err(anyhow::Error::from)?,
         paid_posts,
-    }))
+    })
+    .map_err(anyhow::Error::from)?;
+    context["world"] = json!(state.world.policy.id);
+    if state.world.policy.features().scorer {
+        context["episode"] = state.store.world_status(
+            &state.society.instance_id,
+            &actor.actor_id,
+            &state.world.policy,
+        )?;
+    }
+    Ok(Json(context))
 }
 
 async fn arm_experiment_injection(
@@ -649,7 +674,9 @@ async fn debit_society_wake(
     Extension(actor): Extension<SocietyActor>,
     body: String,
 ) -> Result<Json<fugue_store::WakeDebitReceipt>, ApiError> {
-    if state.society.compute_backing == fugue_store::SocietyComputeBacking::Independent {
+    if state.world.compute_backing(&state.society)
+        == fugue_store::SocietyComputeBacking::Independent
+    {
         return Err(StoreError::Validation(
             "wake debit is unavailable when society.compute_backing is independent".to_string(),
         )
@@ -819,7 +846,11 @@ async fn create_board_post(
     Extension(actor): Extension<SocietyActor>,
     Json(input): Json<CreateBoardPostInput>,
 ) -> Result<Json<fugue_store::BoardPost>, ApiError> {
-    Ok(Json(state.store.create_board_post(&actor.actor_id, input)?))
+    Ok(Json(state.store.create_world_board_post(
+        &actor.actor_id,
+        input,
+        &state.world.policy,
+    )?))
 }
 
 async fn read_board_feed(
@@ -964,15 +995,19 @@ async fn require_substrate_auth(
     Ok(next.run(request).await)
 }
 
+#[derive(Clone)]
+struct GuestTransport;
+
 async fn require_local_or_substrate_auth(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let is_local = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ConnectInfo(address)| is_local_viewer(address.ip(), state.api_host));
+    let is_local = request.extensions().get::<GuestTransport>().is_none()
+        && request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(address)| is_local_viewer(address.ip(), state.api_host));
     if is_local {
         return Ok(next.run(request).await);
     }
@@ -994,6 +1029,42 @@ async fn require_society_auth(
         .society_actor_for_key_hash(&society_key_hash(key))
         .map_err(|_| AuthError)?
         .ok_or(AuthError)?;
+    let features = state.world.policy.features();
+    let path = request.uri().path();
+    // Settlement remains possible after termination, preserving final usage and transcripts.
+    let settlement = matches!(
+        path,
+        "/api/society/wakes/usage"
+            | "/api/society/wakes/transcript"
+            | "/api/society/wakes/debit"
+            | "/api/society/wakes/sleep"
+            | "/api/society/wakes/permit/release"
+            | "/api/society/wakes/status"
+            | "/api/society/wake-context"
+    );
+    if features.scorer
+        && !settlement
+        && state
+            .store
+            .world_ended(
+                &state.society.instance_id,
+                &actor.actor_id,
+                state.world.policy.episodes(),
+            )
+            .map_err(|_| AuthError)?
+    {
+        return Err(AuthError);
+    }
+    if !features.obols && path.starts_with("/api/bank/") {
+        return Err(AuthError);
+    }
+    if !features.newspaper && path.ends_with("/newspaper") {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Newspaper unavailable"})),
+        )
+            .into_response());
+    }
     request.extensions_mut().insert(actor);
     Ok(next.run(request).await)
 }
@@ -1303,13 +1374,7 @@ async fn edit_entity_text(
     Path(entity_id): Path<String>,
     Json(input): Json<EditEntityTextInput>,
 ) -> Result<Json<fugue_store::SynthesisDoc>, ApiError> {
-    let doc = state
-        .store
-        .edit_entity_text(&actor.actor_id, &entity_id, input)?;
-    state
-        .store
-        .enqueue_auto_synthesis(&actor.actor_id, &doc.space_id)?;
-    Ok(Json(doc))
+    Ok(Json(state.store.edit_entity_text(&actor.actor_id, &entity_id, input)?))
 }
 
 async fn change_entity_state(
@@ -1318,13 +1383,7 @@ async fn change_entity_state(
     Path(entity_id): Path<String>,
     Json(input): Json<ChangeEntityStateInput>,
 ) -> Result<Json<fugue_store::SynthesisDoc>, ApiError> {
-    let doc = state
-        .store
-        .change_entity_state(&actor.actor_id, &entity_id, input)?;
-    state
-        .store
-        .enqueue_auto_synthesis(&actor.actor_id, &doc.space_id)?;
-    Ok(Json(doc))
+    Ok(Json(state.store.change_entity_state(&actor.actor_id, &entity_id, input)?))
 }
 
 async fn read_review(
@@ -1398,13 +1457,7 @@ async fn accept_review_item(
     Extension(actor): Extension<AuthActor>,
     Path(review_id): Path<String>,
 ) -> Result<Json<fugue_store::SynthesisDoc>, ApiError> {
-    let doc = state
-        .store
-        .accept_review_item(&actor.actor_id, &review_id)?;
-    state
-        .store
-        .enqueue_auto_synthesis(&actor.actor_id, &doc.space_id)?;
-    Ok(Json(doc))
+    Ok(Json(state.store.accept_review_item(&actor.actor_id, &review_id)?))
 }
 
 #[derive(Debug)]
@@ -1522,7 +1575,8 @@ async fn run_guest_listener(
     println!("guest_api_listener={address}");
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app.layer(Extension(GuestTransport))
+            .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         wait_for_shutdown(&mut shutdown).await;
@@ -1810,6 +1864,9 @@ async fn run_worker_loop(state: AppState) {
 }
 
 async fn run_allowance_loop(state: AppState) {
+    if !state.world.policy.features().allowance_refill {
+        return;
+    }
     loop {
         tokio::time::sleep(Duration::from_secs(300)).await;
         if let Err(error) = state.store.grant_weekly_allowances(
@@ -1989,6 +2046,9 @@ async fn execute_society_newspaper_job(
     job: &WorkerJob,
     attempt_id: &str,
 ) -> anyhow::Result<String> {
+    if !state.world.policy.features().newspaper {
+        return Ok("Newspaper disabled by world".into());
+    }
     if let Some(newspaper) = state.store.committed_society_newspaper_effect(&job.id)? {
         return Ok(format!(
             "Society Newspaper v{} already committed; recovered without replay",

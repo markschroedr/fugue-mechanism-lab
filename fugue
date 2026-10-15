@@ -18,6 +18,27 @@ Commands:
   lab-api       Start the loopback-only multi-society observer API.
   hosted-ui     Start the built hosted UI.
   ui            Start the Svelte UI.
+  e2e           Run browser UI and deterministic backend scenarios with LLM keys disabled.
+  e2e-config    Run the central configuration end-to-end scenario.
+  e2e-snapshot --sandbox PATH --output DIR  Verify real microVM snapshot preservation.
+  e2e-ui        Run the real browser UI accessibility and layout scenario.
+  e2e-society-ui Run the substrate-keyed society admin browser scenario.
+  e2e-lab-ui    Run the multi-society Lab browser scenario.
+  e2e-live      Run end-to-end scenarios whose assertions test live model behavior.
+  e2e-worker    Run the worker lifecycle end-to-end scenario.
+  e2e-mvp       Run the deterministic read/session/review scenario.
+  e2e-agent     Run the live agent-reply composition scenario.
+  e2e-entities  Run the base entity interaction end-to-end scenario.
+  e2e-synthesis Run the live generalized input and written synthesis scenario.
+  e2e-auth      Run identity, anonymous reads, and write-gating scenario.
+  e2e-lesswrong Run the live LessWrong harvest-contract scenario.
+  e2e-refresh   Run the live ForumMagnum refresh/merge scenario.
+  e2e-living    Run deterministic living-report history and causality.
+  e2e-incremental Run live incremental synthesis routing and integration.
+  e2e-objection Run deterministic anonymous objection plumbing.
+  e2e-objection-live Run live objection-to-correction behavior.
+  e2e-crash     Run crash-idempotency around a live synthesis call.
+  e2e-live-plan-a Run Plan-A-scale live harvest and objection proofs (opt in).
   eval          Run the live Ngo-thread synthesis evaluation with a cost report.
   eval-synthesis Alias for eval.
   eval-newspaper [case...] Run the bounded live Newspaper prompt evaluation.
@@ -28,29 +49,43 @@ Commands:
   preview       Preview the hosted SvelteKit build.
   society-birth <name>  Create an agent and write its self-contained Robinson kit.
   society-allowance     Mint this week's configured allowance once per living agent.
-  society-keeper <agent> [vm] Keep one agent's VM resident loop alive (relaunch with backoff).
+  society-keeper  Fair cohort admission before VM boot; keep waiting agents nonresident.
   society-services <core|prepare|install|start|stop|uninstall|status|verify-stopped>  Manage one configured society instance.
   lab-services <start|stop|status>  Manage the host Lab API, built UI, and loopback gateway.
-  experiment <create|copy|configure-compute|prepare|birth|start|stop|recover|status|rebind|society>  Manage portable society experiments.
+  experiment <create|copy|configure-compute|prepare|birth|start|stop|resume|recover|status|rebind|society>  Manage portable society experiments.
+  remote <command>  Operate a configured private runtime appliance through Git and SSH.
   society <subcommand>  Administration: status, feed, show, ledger, receipts, transcript, tell, wake, home.
+  egress-build  Build the user-mode vfkit NAT gateway (Go).
   cargo ...     Run cargo with remaining args.
   bun ...       Run bun with remaining args.
 EOF
 }
 
 write_service_plist() {
-  local plist_path="$1" label="$2" command="$3" log="$4"
-  python3 - "$plist_path" "$label" "$command" "$log" <<'PY'
+  local plist_path="$1" label="$2" command="$3" log="$4" retry="${5:-always}"
+  python3 - "$plist_path" "$label" "$command" "$log" "$retry" <<'PY'
+import os
 import pathlib
 import plistlib
 import sys
 
-path, label, command, log = sys.argv[1:]
+path, label, command, log, retry = sys.argv[1:]
+arguments = ["/bin/zsh", "-lc", command]
+if mount := os.environ.get("SANDBOX_VOLUME_MOUNT"):
+    arguments = [sys.executable, "-c",
+        'import os,sys; p=sys.argv[1]; '
+        'os.stat(p).st_dev != os.stat(os.path.dirname(p)).st_dev or sys.exit("required runtime volume is not mounted"); '
+        'os.execv("/bin/zsh", ["/bin/zsh", "-lc", sys.argv[2]])', mount, command]
 with pathlib.Path(path).open("wb") as destination:
     plistlib.dump({
         "Label": label,
-        "ProgramArguments": ["/bin/zsh", "-lc", command],
-        "KeepAlive": True,
+        "EnvironmentVariables": {key: os.environ[key] for key in (
+            "SANDBOX_STATE_DIR", "SANDBOX_ASSETS_DIR", "SANDBOX_VOLUME_MOUNT", "FUGUE_HOST_FREE_RESERVE_BYTES",
+            "FUGUE_HOST_FREE_PATH", "FUGUE_STATE_FREE_RESERVE_BYTES", "FUGUE_COHORT_HOOK",
+            "SANDBOX_CODEX_AUTH", "FUGUE_GUEST_BIND_PORT", "FUGUE_NOTIFY_COMMAND", "FUGUE_PI_AI_DIR",
+        ) if key in os.environ},
+        "ProgramArguments": arguments,
+        "KeepAlive": {"SuccessfulExit": False} if retry == "on-failure" else True,
         "RunAtLoad": True,
         "StandardOutPath": log,
         "StandardErrorPath": log,
@@ -87,6 +122,7 @@ case "${1:-}" in
     cargo run -q -p fugue-server -- context
     ;;
   init)
+    [[ -z "${FUGUE_SERVER_BIN:-}" ]] || exec "$FUGUE_SERVER_BIN" init
     cargo run -p fugue-server -- init
     ;;
   api)
@@ -96,6 +132,7 @@ case "${1:-}" in
     exec cargo run -p fugue-server
     ;;
   lab-api)
+    [[ -z "${FUGUE_LAB_BIN:-}" ]] || exec "$FUGUE_LAB_BIN"
     exec cargo run -q -p fugue-lab
     ;;
   hosted-ui)
@@ -109,6 +146,76 @@ case "${1:-}" in
     ;;
   ui)
     exec bun run dev
+    ;;
+  e2e)
+    cargo build --workspace
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_config.ts
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_ui.sh
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_society_ui.sh
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_lab_ui.sh
+    bun run scripts/run_e2e_suite.ts deterministic
+    ;;
+  e2e-snapshot)
+    shift
+    exec python3 scripts/e2e_snapshot.py "$@"
+    ;;
+  e2e-config)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_config.ts
+    ;;
+  e2e-ui)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_ui.sh
+    ;;
+  e2e-society-ui)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_society_ui.sh
+    ;;
+  e2e-lab-ui)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 scripts/e2e_lab_ui.sh
+    ;;
+  e2e-live)
+    bun run scripts/run_e2e_suite.ts live
+    ;;
+  e2e-worker)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_worker.ts
+    ;;
+  e2e-mvp)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_mvp.ts
+    ;;
+  e2e-agent)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_agent_reply.ts
+    ;;
+  e2e-entities)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_entity_interactions.ts
+    ;;
+  e2e-synthesis)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_ingest_synthesis.ts
+    ;;
+  e2e-auth)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_auth_surface.ts
+    ;;
+  e2e-lesswrong)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_lesswrong_thread.ts
+    ;;
+  e2e-refresh)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_lesswrong_refresh.ts
+    ;;
+  e2e-living)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_living_report.ts
+    ;;
+  e2e-incremental)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_incremental_synthesis.ts
+    ;;
+  e2e-objection)
+    env -u OPENAI_API_KEY -u OPENROUTER_API_KEY FUGUE_EXPECT_ZERO_LLM=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_public_objection_core.ts
+    ;;
+  e2e-objection-live)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_public_objection.ts
+    ;;
+  e2e-crash)
+    FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/e2e_synthesis_crash.ts
+    ;;
+  e2e-live-plan-a)
+    FUGUE_LIVE_LESSWRONG=1 FUGUE_EVAL_THREAD_URL="https://www.lesswrong.com/posts/z9tXCGogEgkgHSh8G/introduction-for-and-reactions-to-plan-a" bun run scripts/e2e_lesswrong_thread.ts
+    FUGUE_LIVE_LESSWRONG=1 FUGUE_EVAL_THREAD_URL="https://www.lesswrong.com/posts/z9tXCGogEgkgHSh8G/introduction-for-and-reactions-to-plan-a" bun run scripts/e2e_public_objection.ts
     ;;
   eval|eval-synthesis)
     FUGUE_LIVE_LESSWRONG=1 FUGUE_REQUIRE_SCENARIO_COST=1 bun run scripts/eval_synthesis_principles.ts
@@ -148,6 +255,11 @@ case "${1:-}" in
     [[ "$API_HOST" == "0.0.0.0" ]] && API_HOST="127.0.0.1"
     exec curl -fsS -X POST -H "Authorization: Bearer $FUGUE_SUBSTRATE_KEY" "${FUGUE_API_URL:-http://$API_HOST:$API_PORT}/api/society/allowance"
     ;;
+  remote)
+    shift
+    [[ -f "$ROOT/../operator/remote.py" ]] || { print -u2 "remote requires the private operator workspace"; exit 1; }
+    exec python3 "$ROOT/../operator/remote.py" "$@"
+    ;;
   experiment)
     shift
     exec python3 scripts/experiment.py "$@"
@@ -164,24 +276,18 @@ case "${1:-}" in
     FUGUE_API_URL="$API_URL" FUGUE_SANDBOX_BIN="$SANDBOX_BIN" FUGUE_KIT_DIR="$KITS_DIR" exec python3 scripts/society_admin.py "$@"
     ;;
   society-keeper)
-    agent="${2:?agent name required}"
-    vm_name="${3:-$agent}"
+    shift
     SANDBOX_BIN="${FUGUE_SANDBOX_BIN:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"]["sandbox_bin"])' "$CONFIG_PATH")}"
     GUEST_API_URL="$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"]["guest_api_url"])' "$CONFIG_PATH")"
     if [[ ! -x "$SANDBOX_BIN" ]]; then
       print -u2 "society-keeper: sandbox binary not executable: $SANDBOX_BIN"
       exit 1
     fi
-    while true; do
-      started=$(date +%s)
-      (cd "${SANDBOX_BIN:h}" && "$SANDBOX_BIN" run "$vm_name" -- env "FUGUE_API_URL=$GUEST_API_URL" bash -lc 'exec /home/coder/society/runner.py --kit /home/coder/society --home /home/coder') || true
-      elapsed=$(( $(date +%s) - started ))
-      # A run that dies within two minutes is a halt (no balance, bad quota) or a
-      # crash loop; back off long so relaunching is sleep, not hammering.
-      if (( elapsed < 120 )); then sleep 1800; else sleep 30; fi
-    done
+    FUGUE_COHORT_HOOK="${FUGUE_COHORT_HOOK:-$ROOT/scripts/observer/cohort.py}" \
+      FUGUE_CONFIG="$CONFIG_PATH" FUGUE_SANDBOX_BIN="$SANDBOX_BIN" exec python3 scripts/society_keeper.py "$@"
     ;;
   society-services)
+    export FUGUE_GUEST_BIND_PORT="${FUGUE_GUEST_BIND_PORT:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["api"]["port"]+1)' "$CONFIG_PATH")}"
     action="${2:?core|prepare|install|start|stop|uninstall|status|verify-stopped required}"
     INSTANCE_ID="$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c.get("society",{}).get("instance_id","default"))' "$CONFIG_PATH")"
     LABEL_PREFIX="com.fugue.society"
@@ -197,6 +303,13 @@ case "${1:-}" in
     [[ "$KITS_DIR" != /* ]] && KITS_DIR="${CONFIG_PATH:h}/$KITS_DIR"
     SANDBOX_BIN="${FUGUE_SANDBOX_BIN:-$(python3 -c 'import sys,tomllib; c=tomllib.load(open(sys.argv[1],"rb")); print(c["society"].get("sandbox_bin",""))' "$CONFIG_PATH")}"
     SERVER_BIN="${FUGUE_SERVER_BIN:-}"
+    RUNTIME_DIR="${FUGUE_SERVICE_RUNTIME_DIR:-$INSTANCE_HOME/runtime}"
+    PYTHON_BIN="$(command -v python3)"
+    install_keeper_runtime() {
+      mkdir -p "$RUNTIME_DIR"
+      install -m 0755 "$ROOT/scripts/society_keeper.py" "$RUNTIME_DIR/society_keeper.py"
+      install -m 0644 "$ROOT/scripts/robinson_runner.py" "$RUNTIME_DIR/robinson_runner.py"
+    }
     loaded_society_service_labels() {
       local selection="$1" pid exit_status label listing keeper_prefix="$LABEL_PREFIX.keeper-"
       listing="$(launchctl list)" || return 1
@@ -242,26 +355,32 @@ case "${1:-}" in
       return 1
     }
     install_keepers() {
+      export FUGUE_COHORT_HOOK="${FUGUE_COHORT_HOOK:-$ROOT/scripts/observer/cohort.py}"
+      [[ -f "$FUGUE_COHORT_HOOK" ]] || { print -u2 "host cohort driver is missing"; exit 1; }
+      install_keeper_runtime
       [[ -x "$SANDBOX_BIN" ]] || { print -u2 "sandbox binary not executable: $SANDBOX_BIN"; exit 1; }
-      for kit in "$KITS_DIR"/*(N/); do
-        agent="${kit:t}"
-        vm_name="$agent"
-        [[ "$INSTANCE_ID" != "default" ]] && vm_name="$INSTANCE_ID-$agent"
-        write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.keeper-$agent.plist" "$LABEL_PREFIX.keeper-$agent" \
-          "cd '$ROOT' && FUGUE_CONFIG='$CONFIG_PATH' FUGUE_KIT_DIR='$KITS_DIR' FUGUE_SANDBOX_BIN='$SANDBOX_BIN' exec ./fugue society-keeper '$agent' '$vm_name'" \
-          "$LOG_DIR/keeper-$agent.log"
-        reload_service_plist "$LABEL_PREFIX.keeper-$agent" "$AGENTS_DIR/$LABEL_PREFIX.keeper-$agent.plist"
-        print "installed $LABEL_PREFIX.keeper-$agent"
-      done
+      labels="$(loaded_society_service_labels keepers)" || exit 1
+      while IFS= read -r label; do
+        [[ -n "$label" ]] && unload_service_label "$label"
+      done <<< "$labels"
+      write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.keeper-cohort.plist" "$LABEL_PREFIX.keeper-cohort" \
+        "FUGUE_CONFIG='$CONFIG_PATH' FUGUE_KIT_DIR='$KITS_DIR' FUGUE_SANDBOX_BIN='$SANDBOX_BIN' exec '$PYTHON_BIN' '$RUNTIME_DIR/society_keeper.py'" \
+        "$LOG_DIR/keeper-cohort.log" on-failure
+      reload_service_plist "$LABEL_PREFIX.keeper-cohort" "$AGENTS_DIR/$LABEL_PREFIX.keeper-cohort.plist"
+      print "installed $LABEL_PREFIX.keeper-cohort"
     }
     case "$action" in
       core|install|prepare)
         mkdir -p "$LOG_DIR" "$AGENTS_DIR"
         [[ -f "$SUBSTRATE_KEY_FILE" ]] || { print -u2 "missing substrate key: $SUBSTRATE_KEY_FILE"; exit 1; }
         [[ -z "$SERVER_BIN" || -x "$SERVER_BIN" ]] || { print -u2 "server binary not executable: $SERVER_BIN"; exit 1; }
+        install_keeper_runtime
+        API_PROGRAM="exec ./fugue api"
+        [[ -z "$SERVER_BIN" ]] || API_PROGRAM="exec '$SERVER_BIN'"
+        API_COMMAND="unset OPENAI_API_KEY OPENROUTER_API_KEY; FUGUE_CONFIG='$CONFIG_PATH' FUGUE_DATA_DIR='$DATA_DIR' FUGUE_SUBSTRATE_KEY=\$(cat '$SUBSTRATE_KEY_FILE') $API_PROGRAM"
+        [[ -n "$SERVER_BIN" ]] || API_COMMAND="cd '$ROOT' && $API_COMMAND"
         write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.api.plist" "$LABEL_PREFIX.api" \
-          "cd '$ROOT' && FUGUE_CONFIG='$CONFIG_PATH' FUGUE_DATA_DIR='$DATA_DIR' FUGUE_SUBSTRATE_KEY=\$(cat '$SUBSTRATE_KEY_FILE') FUGUE_SERVER_BIN='$SERVER_BIN' exec ./fugue api" \
-          "$LOG_DIR/api.log"
+          "$API_COMMAND" "$LOG_DIR/api.log"
         reload_service_plist "$LABEL_PREFIX.api" "$AGENTS_DIR/$LABEL_PREFIX.api.plist"
         print "installed $LABEL_PREFIX.api"
         if [[ "$action" == "install" ]]; then
@@ -337,7 +456,7 @@ case "${1:-}" in
     [[ -n "$HOST_CONFIG" ]] || { print -u2 'lab-services requires FUGUE_HOST_CONFIG'; exit 1; }
     [[ -f "$HOST_CONFIG" ]] || { print -u2 "host config missing: $HOST_CONFIG"; exit 1; }
     HOST_CONFIG="${HOST_CONFIG:A}"
-    LABEL_PREFIX="com.fugue.lab"
+    LABEL_PREFIX="${FUGUE_LAB_LABEL_PREFIX:-com.fugue.lab}"
     AGENTS_DIR="$HOME/Library/LaunchAgents"
     case "$action" in
       start)
@@ -354,7 +473,7 @@ case "${1:-}" in
         [[ -f "$CADDY_CONFIG" ]] || { print -u2 "caddy config missing: $CADDY_CONFIG"; exit 1; }
         mkdir -p "$LOG_DIR" "$AGENTS_DIR"
         write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.api.plist" "$LABEL_PREFIX.api" \
-          "cd '$ROOT' && FUGUE_HOST_CONFIG='$HOST_CONFIG' FUGUE_LAB_HOST=127.0.0.1 FUGUE_LAB_PORT='$LAB_PORT' exec ./fugue lab-api" \
+          "cd '$ROOT' && FUGUE_HOST_CONFIG='$HOST_CONFIG' FUGUE_LAB_HOST=127.0.0.1 FUGUE_LAB_PORT='$LAB_PORT' FUGUE_LAB_BIN='${FUGUE_LAB_BIN:-}' exec ./fugue lab-api" \
           "$LOG_DIR/api.log"
         write_service_plist "$AGENTS_DIR/$LABEL_PREFIX.ui.plist" "$LABEL_PREFIX.ui" \
           "cd '$ROOT' && FUGUE_UI_HOST=127.0.0.1 FUGUE_PREVIEW_PORT='$UI_PORT' exec ./fugue hosted-ui" \
@@ -383,6 +502,9 @@ case "${1:-}" in
         exit 2
         ;;
     esac
+    ;;
+  egress-build)
+    (cd "$ROOT/resources/egress" && GOMAXPROCS=1 GOGC=50 go build -p 1 -o "$ROOT/target/egress" .)
     ;;
   cargo)
     shift

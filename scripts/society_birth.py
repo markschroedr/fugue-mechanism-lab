@@ -16,6 +16,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+if __package__:
+    from .worlds import definition, refresh_kit
+else:
+    from worlds import definition, refresh_kit
+
 
 def compact(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -95,10 +100,11 @@ def main() -> int:
     with config_path.open("rb") as handle:
         config = tomllib.load(handle)
     society = config.get("society", {})
+    definition(root, society)  # Reject unknown worlds before creating identity or authority.
     runner = society.get("runner", {})
     models = society.get("models", {})
-    if set(models) != {"luna", "terra", "sol"}:
-        raise RuntimeError("society.models must define exactly luna, terra, and sol")
+    if not models or runner.get("default_model", "luna") not in models:
+        raise RuntimeError("society.models must include the configured default model")
     address = address_for(args.name)
     configured_kit_dir = Path(society.get("kit_dir", "data/kits"))
     if not configured_kit_dir.is_absolute():
@@ -117,17 +123,6 @@ def main() -> int:
         host = "127.0.0.1"
     port = os.environ.get("FUGUE_API_PORT", str(config["api"]["port"]))
     host_api_url = os.environ.get("FUGUE_API_URL", f"http://{host}:{port}")
-
-    sources = {
-        "society_node.py": root / "scripts" / "society_node.py",
-        "runner.py": root / "scripts" / "robinson_runner.py",
-        "sleep.ts": root / "scripts" / "robinson_sleep.ts",
-        "SKILL-society-node.md": root / "scripts" / "society-kit" / "SKILL-society-node.md",
-        "SPAWN.md": root / "scripts" / "society-kit" / "SPAWN.md",
-    }
-    for source in sources.values():
-        if not source.is_file():
-            raise RuntimeError(f"missing kit source: {source}")
 
     kit_root.mkdir(parents=True, exist_ok=True)
     identity = {"address": address, "name": args.name.strip()}
@@ -174,39 +169,21 @@ def main() -> int:
                 address, float(runner.get("default_sleep_seconds", 300))
             ),
             "wallTimeoutSeconds": runner.get("wall_timeout_seconds", 86400),
+            "hardStopAt": runner.get("hard_stop_at"),
             "pollSeconds": runner.get("poll_seconds", 0.2),
             "quotaThresholdPercent": runner.get("quota_threshold_percent", 85),
             "quotaPauseSeconds": runner.get("quota_pause_seconds", 600),
             "quotaProbe": runner.get("quota_probe", True),
         }
         node = {
-            "apiBaseUrl": society.get("guest_api_url", "http://10.0.0.1:49321"),
+            "apiBaseUrl": society.get("guest_api_url", "http://192.168.64.1:49321"),
             "address": address,
             "runner": runner_config,
         }
         (pending / "node.json").write_text(compact(node) + "\n", encoding="utf-8")
         rates = {"obolUsd": 0.01, "models": models}
         (pending / "rates.json").write_text(compact(rates) + "\n", encoding="utf-8")
-        for name in ["society_node.py", "runner.py", "sleep.ts", "SKILL-society-node.md"]:
-            shutil.copyfile(sources[name], pending / name)
-        os.chmod(pending / "runner.py", 0o755)
-        os.chmod(pending / "society_node.py", 0o755)
-        spawn = sources["SPAWN.md"].read_text(encoding="utf-8")
-        replacements = {
-            "{NAME}": args.name.strip(),
-            "{ADDRESS}": address,
-            "{MISSION}": str(society.get("mission", "You are here. Choose what to do. Stay active.")).strip(),
-            "{ROLE_SECTION}": f"\n## Role\n\n{args.role.strip()}\n" if args.role and args.role.strip() else "",
-            "{WORK_POINTERS}": "none yet.",
-            "{LIVE_SPEND_FILE}": "~/.robinson-live-spend.json",
-            "{RATES_FILE}": "~/society/rates.json",
-            "{NOTE_FILE}": "~/note-to-self.md",
-        }
-        for placeholder, value in replacements.items():
-            spawn = spawn.replace(placeholder, value)
-        if re.search(r"\{[A-Z_]+\}", spawn):
-            raise RuntimeError("SPAWN.md contains an unresolved placeholder")
-        (pending / "SPAWN.md").write_text(spawn, encoding="utf-8")
+        refresh_kit(root, pending, society, name=args.name.strip(), role=args.role or "", force=True)
 
         credential = post(host_api_url, substrate_key, "/api/society/birth", {
             "address": address,

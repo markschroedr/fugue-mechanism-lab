@@ -21,9 +21,14 @@ def main() -> int:
     except (ValueError, IndexError):
         print("fake executor requires --session PATH", file=sys.stderr)
         return 2
-    wake = int(session.stem.split("-")[-1])
+    wake = int(os.environ["ROBINSON_WAKE_NUMBER"])
+    onboarding = any(value.endswith("SPAWN.md") for value in args) and any(value.endswith("SKILL-society-node.md") for value in args)
+    if onboarding != (wake == 1):
+        print("onboarding must be supplied only for the first wake", file=sys.stderr)
+        return 2
     session.parent.mkdir(parents=True, exist_ok=True)
-    session.write_text(line({"type": "session", "version": 3, "id": f"fake-{wake}", "timestamp": "2026-08-27T00:00:00.000Z", "cwd": os.getcwd(), "computeBacking": os.environ.get("ROBINSON_COMPUTE_BACKING")}), encoding="utf-8")
+    if not session.exists():
+        session.write_text(line({"type": "session", "version": 3, "id": "fake-continuing", "timestamp": "2026-08-27T00:00:00.000Z", "cwd": os.getcwd(), "computeBacking": os.environ.get("ROBINSON_COMPUTE_BACKING")}), encoding="utf-8")
     if wake == 1:
         action = subprocess.run(
             ["society-node", "space", "create", "--slug", "runner-proof", "--name", "Runner Proof"],
@@ -39,6 +44,9 @@ def main() -> int:
                 "usage": {"input": 1001, "output": 0, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0,
                           "totalTokens": 1001, "cost": {"total": 9999.0}}
             }}))
+            handle.write(line({"type": "compaction", "id": "compaction-1", "summary": "continued", "tokensBefore": 270000,
+                               "usage": {"input": 5, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+                                         "totalTokens": 7, "cost": {"total": 9999.0}}}))
         write_sleep("0.02s", "luna", "high", 5)
         return 0
     if wake == 2:

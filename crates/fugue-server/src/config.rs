@@ -83,6 +83,11 @@ pub(crate) struct ForumMagnumConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SocietyConfig {
+    #[serde(default = "default_world")]
+    pub world: String,
+    /// Operator declarations only; the world does not install these services.
+    #[serde(default)]
+    pub instrumentation: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_society_instance_id")]
     pub instance_id: String,
     #[serde(default = "default_society_mission")]
@@ -113,6 +118,8 @@ pub(crate) struct SocietyConfig {
 impl Default for SocietyConfig {
     fn default() -> Self {
         Self {
+            world: default_world(),
+            instrumentation: Default::default(),
             instance_id: default_society_instance_id(),
             mission: default_society_mission(),
             treasury_address: default_treasury_address(),
@@ -150,6 +157,9 @@ pub(crate) struct SocietyRunnerConfig {
     pub active_hours_end: u8,
     #[serde(default = "default_wall_timeout_seconds")]
     pub wall_timeout_seconds: u64,
+    /// Absolute operator cutoff; enforced by both keeper and guest runner.
+    #[serde(default)]
+    pub hard_stop_at: Option<String>,
     #[serde(default = "default_poll_seconds")]
     pub poll_seconds: f64,
     #[serde(default = "default_quota_threshold")]
@@ -178,6 +188,7 @@ impl Default for SocietyRunnerConfig {
             active_hours_start: default_active_hours_start(),
             active_hours_end: default_active_hours_end(),
             wall_timeout_seconds: default_wall_timeout_seconds(),
+            hard_stop_at: None,
             poll_seconds: default_poll_seconds(),
             quota_threshold_percent: default_quota_threshold(),
             quota_pause_seconds: default_quota_pause_seconds(),
@@ -187,6 +198,10 @@ impl Default for SocietyRunnerConfig {
             wake_lease_seconds: default_wake_lease_seconds(),
         }
     }
+}
+
+fn default_world() -> String {
+    "honest".into()
 }
 
 fn default_society_instance_id() -> String {
@@ -350,6 +365,12 @@ impl FugueConfig {
 
     fn resolve_relative_paths(&mut self, config_path: &Path) {
         let root = config_path.parent().unwrap_or_else(|| Path::new("."));
+        if self.society.world != "honest" && Path::new(&self.society.world).is_relative() {
+            self.society.world = root
+                .join(&self.society.world)
+                .to_string_lossy()
+                .into_owned();
+        }
         if self.storage.data_dir.is_relative() {
             self.storage.data_dir = root.join(&self.storage.data_dir);
         }
@@ -397,7 +418,7 @@ impl FugueConfig {
         }
         if self.society.weekly_allowance <= 0
             || self.society.runner.default_sleep_seconds < 0.0
-            || self.society.runner.max_sleep_seconds <= 0.0
+            || self.society.runner.max_sleep_seconds < 0.0
             || self.society.runner.default_sleep_seconds > self.society.runner.max_sleep_seconds
             || self.society.runner.active_hours_timezone.trim().is_empty()
             || self.society.runner.active_hours_start >= self.society.runner.active_hours_end
@@ -412,12 +433,11 @@ impl FugueConfig {
                 "society identity, mission, allowance, timing, wake gate, and quota values must be valid"
             );
         }
-        for alias in ["luna", "terra", "sol"] {
-            let model = self
-                .society
-                .models
-                .get(alias)
-                .ok_or_else(|| anyhow::anyhow!("society.models must define {alias}"))?;
+        if let Some(cutoff) = &self.society.runner.hard_stop_at {
+            time::OffsetDateTime::parse(cutoff, &time::format_description::well_known::Rfc3339)
+                .context("society.runner.hard_stop_at must be an RFC3339 timestamp")?;
+        }
+        for (alias, model) in &self.society.models {
             if model.model.trim().is_empty()
                 || [
                     model.input_usd_per_million,
@@ -453,13 +473,20 @@ impl FugueConfig {
 
     pub(crate) fn api_listeners(&self) -> anyhow::Result<ApiListeners> {
         let host = SocketAddr::new(self.api.host, self.api.port);
-        let guest = self
-            .society
-            .guest_api_url
-            .as_deref()
-            .map(parse_guest_api_url)
-            .transpose()?
-            .map(SocketAddr::V4);
+        let guest = if let Ok(port) = env::var("FUGUE_GUEST_BIND_PORT") {
+            let port: u16 = port.parse().context("invalid FUGUE_GUEST_BIND_PORT")?;
+            if port == 0 || port == self.api.port {
+                anyhow::bail!("guest transport requires a separate nonzero port");
+            }
+            Some(SocketAddr::new(IpAddr::V4(HOST_API_ADDRESS), port))
+        } else {
+            self.society
+                .guest_api_url
+                .as_deref()
+                .map(parse_guest_api_url)
+                .transpose()?
+                .map(SocketAddr::V4)
+        };
         Ok(ApiListeners {
             host,
             guest: guest.filter(|guest| *guest != host),

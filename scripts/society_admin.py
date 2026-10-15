@@ -105,31 +105,28 @@ def host_processes() -> dict[str, dict[str, bool]]:
 def cmd_status(_: argparse.Namespace) -> None:
     key = substrate_key()
     bank = api("GET", "/api/bank", key)
-    procs = host_processes()
+    overview = api("GET", "/api/society/admin", key)
+    lifecycle = {a["address"]: a.get("lifecycle", {}).get("phase", "unreported") for a in overview["agents"]}
     agents = [a for a in bank["accounts"] if a["address"] not in {"treasury", "oracle"}]
-    print(f"{'agent':<10} {'obols':>5}  {'vm':<8} {'wakes':>5}  last settlement")
+    print(f"{'agent':<10} {'obols':>5}  {'phase':<10} {'wakes':>5}  last settlement")
     for account in agents:
         address = account["address"]
         usage = api("GET", f"/api/bank/usage?agent={address}", key)
         wakes = len(usage)
         last = usage[-1] if usage else None
-        proc = procs.get(address, {})
-        vm = "resident" if proc.get("run") else ("vm-only" if proc.get("vm") else "down")
-        if not proc.get("keeper"):
-            vm += "!"
         last_txt = (
             f"wake {last.get('wakeNumber', '?')} · {last['model'].split('/')[-1]}"
             f" · ${last['costUsd']:.4f} · {when(last['createdAt'])}"
             if last
             else "none"
         )
-        print(f"{address:<10} {account['balance']:>5}  {vm:<8} {wakes:>5}  {last_txt}")
+        print(f"{address:<10} {account['balance']:>5}  {lifecycle.get(address, 'unreported'):<10} {wakes:>5}  {last_txt}")
     extras = {a["address"]: a["balance"] for a in bank["accounts"] if a["address"] in {"treasury", "oracle"}}
     print(
         f"\nminted {bank['totalMinted']} · held {bank['totalBalances']}"
         f" · treasury {extras.get('treasury', 0)} · oracle {extras.get('oracle', 0)}"
     )
-    print("vm states: resident = alive in its loop · down = keeper will relaunch · '!' = no keeper")
+    print("phase = last lifecycle reported to the API, not host VM liveness; unreported = no lifecycle report yet")
 
 
 def commons_space_id(key: str) -> str:

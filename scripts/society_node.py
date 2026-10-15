@@ -105,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("identity")
     commands.add_parser("balance")
     commands.add_parser("budget")
+    commands.add_parser("scorer")
+    commands.add_parser("leaderboard")
+    submit = commands.add_parser("submit")
+    submit.add_argument("--id", required=True)
+    source = submit.add_mutually_exclusive_group(required=True)
+    source.add_argument("--values", nargs="*")
+    source.add_argument("--json", type=Path)
 
     directory = commands.add_parser("directory").add_subparsers(dest="action", required=True)
     directory.add_parser("list")
@@ -163,6 +170,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> Any:
+    if args.command == "scorer":
+        return request("GET", "/api/world/scorer")
+    if args.command == "leaderboard":
+        return request("GET", "/api/world/leaderboard")
+    if args.command == "submit":
+        try:
+            body = json.loads(args.json.read_text(encoding="utf-8")) if args.json else {"values": args.values}
+        except (OSError, ValueError) as error:
+            raise NodeError(f"cannot read submission: {error}") from error
+        if not isinstance(body, dict):
+            raise NodeError("submission JSON must be an object")
+        body["submissionId"] = args.id
+        return request("POST", "/api/world/submissions", body)
     if args.command == "budget":
         return request("GET", "/api/society/budget")
     if args.command in ("identity", "balance"):

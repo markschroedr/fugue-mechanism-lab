@@ -1,0 +1,195 @@
+#!/bin/sh
+set -eu
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mkdir -p /dev /proc /sys /newroot /control
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+trap 'sync; poweroff -f' EXIT
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t ext4 /dev/vda /newroot
+install -m 0755 /home_snapshot.py /newroot/usr/local/sbin/home_snapshot.py
+
+mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run/sandbox-control
+mount -t devtmpfs devtmpfs /newroot/dev
+mount -t proc proc /newroot/proc
+mount -t sysfs sysfs /newroot/sys
+
+if [ -b /dev/vdb ]; then
+  mount -t ext4 -o ro /dev/vdb /control
+  mount -o bind /control /newroot/run/sandbox-control
+fi
+
+ip link set lo up
+ip link set eth0 up
+udhcpc -i eth0 -q -n -t 8 -T 2 || {
+  echo "sandbox: DHCP failed" >&2
+  poweroff -f
+}
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /newroot/etc/resolv.conf
+
+apply_network_restriction() {
+  [ ! -f /newroot/etc/sandbox-restricted.nft ] || \
+    chroot /newroot /usr/sbin/nft -f /etc/sandbox-restricted.nft || {
+      echo "sandbox: failed to apply the network restriction" >&2
+      poweroff -f
+    }
+}
+
+apply_network_restriction
+
+mode="$(cat /control/mode 2>/dev/null || printf shell)"
+echo "--- sandbox output ---"
+set +e
+status=0
+case "$mode" in
+  provision)
+    chroot /newroot /usr/local/sbin/sandbox-provision
+    status=$?
+    ;;
+  command)
+    chroot /newroot /bin/su - coder -c \
+      'set -a; [ ! -f "$HOME/.config/sandbox/env.sh" ] || . "$HOME/.config/sandbox/env.sh"; set +a; export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH" GIT_PAGER=cat PAGER=cat; cd /home/coder/project && exec /bin/bash /run/sandbox-control/command.sh'
+    status=$?
+    ;;
+  import-auth)
+    install -d -m 0700 -o 1000 -g 1000 /newroot/home/coder/.pi/agent && \
+      install -m 0600 -o 1000 -g 1000 \
+        /control/auth.json /newroot/home/coder/.pi/agent/auth.json
+    status=$?
+    [ "$status" -eq 0 ] && echo "sandbox: Pi OpenAI auth imported"
+    ;;
+  import-home)
+    install -d -m 0755 -o 1000 -g 1000 /newroot/home/coder
+    chroot /newroot /bin/tar -xzf /run/sandbox-control/home.tar.gz -C /home/coder
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      chroot /newroot /bin/chown -R 1000:1000 /home/coder
+      status=$?
+    fi
+    [ "$status" -eq 0 ] && echo "sandbox: coder home imported"
+    ;;
+  export-home)
+    mount -o remount,rw /control
+    chroot /newroot /bin/su - coder -c \
+      'python3 /usr/local/sbin/home_snapshot.py --output -' \
+      > /control/home.tar.gz
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      sha256sum /control/home.tar.gz > /control/home.tar.gz.sha256
+      status=$?
+    fi
+    [ "$status" -eq 0 ] && echo "sandbox: coder home exported"
+    ;;
+  import-git)
+    branch="$(cat /control/branch)"
+    expected="$(cat /control/commit)"
+    destination="$(cat /control/destination)"
+    if [ "$destination" != /home/coder/project ] && \
+       ! printf '%s\n' "$destination" \
+         | grep -Eq '^/home/coder/repositories/[a-z0-9][a-z0-9-]*$'; then
+      echo "sandbox: invalid Git import destination" >&2
+      poweroff -f
+    fi
+    destination_root="/newroot$destination"
+    if [ -e "$destination_root" ] && [ -n "$(find "$destination_root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      echo "sandbox: Git import destination is not empty" >&2
+      status=2
+    else
+      install -d -m 0755 -o 1000 -g 1000 "$(dirname "$destination_root")"
+      rmdir "$destination_root" 2>/dev/null || true
+      chroot /newroot /bin/su - coder -c \
+        "git clone --quiet --branch \"\$(cat /run/sandbox-control/branch)\" /run/sandbox-control/repo.bundle '$destination' && cd '$destination' && git remote remove origin"
+      status=$?
+      if [ "$status" -eq 0 ]; then
+        actual="$(chroot /newroot /bin/su - coder -c "git -C '$destination' rev-parse HEAD")"
+        [ "$actual" = "$expected" ] || { echo "sandbox: imported commit mismatch" >&2; status=2; }
+      fi
+      git_name="$(cat /control/git-name)"
+      git_email="$(cat /control/git-email)"
+      [ "$status" -ne 0 ] || [ -z "$git_name" ] || chroot /newroot /bin/su - coder -c "git -C '$destination' config user.name '$git_name'"
+      [ "$status" -ne 0 ] || [ -z "$git_email" ] || chroot /newroot /bin/su - coder -c "git -C '$destination' config user.email '$git_email'"
+    fi
+    [ "$status" -eq 0 ] && echo "sandbox: Git branch imported at $expected"
+    ;;
+  set-env)
+    key="$(cat /control/key)"
+    target=/newroot/home/coder/.config/sandbox/env.sh
+    install -d -m 0700 -o 1000 -g 1000 "$(dirname "$target")"
+    touch "$target"
+    sed -i "/^${key}=/d" "$target"
+    cat /control/assignment >> "$target"
+    chown 1000:1000 "$target"
+    chmod 0600 "$target"
+    status=$?
+    [ "$status" -eq 0 ] && echo "sandbox: environment variable $key stored"
+    ;;
+  restrict-network)
+    allowed_host="$(cat /control/allowed-host)"
+    allowed_port="$(cat /control/allowed-port)"
+    valid_host=1
+    old_ifs="$IFS"
+    IFS=.
+    set -- $allowed_host
+    IFS="$old_ifs"
+    [ "$#" -eq 4 ] || valid_host=0
+    for octet in "$@"; do
+      [ "$octet" -le 255 ] || valid_host=0
+    done
+    if ! printf '%s\n' "$allowed_host" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' ||
+       [ "$valid_host" -ne 1 ] ||
+       ! printf '%s\n' "$allowed_port" | grep -Eq '^[0-9]{1,5}$' ||
+       [ "$allowed_port" -lt 1 ] || [ "$allowed_port" -gt 65535 ]; then
+      echo "sandbox: invalid network restriction" >&2
+      status=2
+    else
+      status=0
+      chroot /newroot /sbin/apk add --no-cache nftables || status=$?
+      if [ "$status" -eq 0 ] && chroot /newroot /sbin/apk info -e sudo >/dev/null 2>&1; then
+        chroot /newroot /sbin/apk del sudo || status=$?
+      fi
+      if [ "$status" -eq 0 ] && grep -Eq '^wheel:.*(^|,)coder(,|$)' /newroot/etc/group; then
+        chroot /newroot /usr/sbin/delgroup coder wheel || status=$?
+      fi
+      if [ "$status" -eq 0 ]; then
+        cat > /newroot/etc/sandbox-restricted.nft <<EOF
+flush ruleset
+table inet sandbox {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    oifname "lo" accept
+    ct state established,related accept
+    ip daddr $allowed_host tcp dport $allowed_port accept
+    ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } reject
+    ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } reject
+  }
+}
+EOF
+        chmod 0600 /newroot/etc/sandbox-restricted.nft
+        apply_network_restriction
+        status=$?
+      fi
+    fi
+    [ "$status" -eq 0 ] && echo "sandbox: guest network and privilege boundary restricted"
+    ;;
+  setup-subagents)
+    chroot /newroot /run/sandbox-control/setup-pi-subagents \
+      /run/sandbox-control/pi-skills /run/sandbox-control/pi-agents
+    status=$?
+    ;;
+  shell)
+    echo "sandbox: isolated guest; exit or run 'sudo poweroff' to return to macOS"
+    setsid -c chroot /newroot /bin/su - coder -c \
+      'set -a; [ ! -f "$HOME/.config/sandbox/env.sh" ] || . "$HOME/.config/sandbox/env.sh"; set +a; cd /home/coder/project && exec /bin/bash -l'
+    status=$?
+    ;;
+  *)
+    echo "sandbox: unknown control mode: $mode" >&2
+    status=2
+    ;;
+esac
+
+echo "--- sandbox exit: $status ---"
+exit "$status"

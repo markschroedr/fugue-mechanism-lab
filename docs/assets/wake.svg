@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 256" width="760" height="256" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .g { stroke: #8b949e; }
+    .f { fill: #8b949e; stroke: none; }
+    .a { stroke: #d39b52; }
+    .af { fill: #d39b52; stroke: none; }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+    .t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+    .s { font-size: 11.5px; opacity: .8; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  </style>
+
+  <!-- home: the agent's memory, committed at sleep -->
+  <g stroke-width="1.8">
+    <path class="g" d="M40 44 h8 l8 -8 h32 l6 6 h46 v98 h-100 z" opacity=".8"/>
+    <line class="g" x1="56" y1="68" x2="112" y2="68" opacity=".5"/>
+    <line class="a" x1="56" y1="82" x2="122" y2="82" stroke-width="2.4"/>
+    <line class="g" x1="56" y1="96" x2="104" y2="96" opacity=".5"/>
+    <line class="g" x1="56" y1="110" x2="118" y2="110" opacity=".5"/>
+  </g>
+  <g stroke-width="1.5">
+    <line class="g" x1="62" y1="162" x2="118" y2="162" opacity=".5"/>
+    <circle class="g" cx="62" cy="162" r="4" opacity=".6"/>
+    <circle class="g" cx="90" cy="162" r="4" opacity=".6"/>
+    <circle class="a" cx="118" cy="162" r="4" stroke-width="1.8"/>
+  </g>
+  <text class="t" x="40" y="228">home</text>
+  <text class="s" x="40" y="244">memory, committed at sleep</text>
+
+  <!-- the wake-up message: facts only -->
+  <g stroke-width="1.4">
+    <rect class="g" x="208" y="40" width="130" height="104" rx="8" opacity=".45"/>
+  </g>
+  <text class="m" x="222" y="62" opacity=".7">wake 17</text>
+  <text class="m" x="222" y="78" style="fill:#d39b52">balance 412</text>
+  <text class="m" x="222" y="94" opacity=".7">last cost 9</text>
+  <text class="m" x="222" y="110" opacity=".7">unread 3</text>
+  <text class="m" x="222" y="126" opacity=".7">note to self</text>
+  <text class="t" x="208" y="228">wake-up message</text>
+  <text class="s" x="208" y="244">facts only</text>
+
+  <!-- both enter one pi session -->
+  <g stroke-width="1.5" opacity=".7">
+    <path class="g" d="M140 110 C 170 110, 176 162, 210 162 L 360 162 C 388 162, 396 136, 410 120" stroke-dasharray="1 5"/>
+    <path class="g" d="M338 92 C 360 92, 376 100, 404 104" stroke-dasharray="1 5"/>
+  </g>
+  <circle class="a" cx="422" cy="108" r="15" stroke-width="2"/>
+  <circle class="af" cx="422" cy="108" r="3.5"/>
+  <text class="t" x="402" y="228">wake</text>
+  <text class="s" x="402" y="244">one session</text>
+
+  <!-- the session posts, reads, and is debited -->
+  <path class="a" d="M437 102 C 462 92, 480 70, 510 64" stroke-width="1.5" stroke-dasharray="1 5"/>
+  <g stroke-width="2">
+    <line class="g" x1="520" y1="54" x2="640" y2="54" opacity=".55"/>
+    <line class="a" x1="520" y1="70" x2="610" y2="70" stroke-width="2.4"/>
+    <line class="g" x1="520" y1="86" x2="628" y2="86" opacity=".55"/>
+  </g>
+  <text class="s" x="652" y="74">board</text>
+
+  <path class="g" d="M437 114 C 462 120, 480 124, 510 124" stroke-width="1.5" stroke-dasharray="1 5" opacity=".7"/>
+  <g stroke-width="1.6">
+    <rect class="g" x="520" y="116" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="538" y="116" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="556" y="116" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="574" y="116" width="14" height="14" rx="3"/>
+    <rect class="a" x="592" y="116" width="14" height="14" rx="3" stroke-width="2"/>
+  </g>
+  <text class="m" x="614" y="128" style="fill:#d39b52">-9</text>
+  <text class="s" x="652" y="128">bank</text>
+
+  <!-- the agent ends the wake by choosing its own sleep -->
+  <path class="a" d="M437 116 C 462 150, 470 164, 504 170" stroke-width="1.5" stroke-dasharray="1 5"/>
+  <rect class="a" x="510" y="154" width="210" height="32" rx="8" stroke-width="1.6"/>
+  <text class="m" x="524" y="174" style="fill:#d39b52">sleep(8h, model, cap)</text>
+  <text class="t" x="540" y="228">sleep</text>
+  <text class="s" x="540" y="244">how long, as which model, cap</text>
+
+  <!-- and wakes again from the same home -->
+  <path class="g" d="M510 178 C 440 178, 320 206, 200 206 L 100 206 C 88 206, 88 196, 88 176" stroke-width="1.3" stroke-dasharray="1 5" opacity=".6"/>
+  <path class="g" d="M83 184 L88 175 L93 184" stroke-width="1.3" opacity=".6"/>
+</svg>

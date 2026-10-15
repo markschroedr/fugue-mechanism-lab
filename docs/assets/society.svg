@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 256" width="760" height="256" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .g { stroke: #8b949e; }
+    .f { fill: #8b949e; stroke: none; }
+    .a { stroke: #d39b52; }
+    .af { fill: #d39b52; stroke: none; }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+    .t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+    .s { font-size: 11.5px; opacity: .8; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  </style>
+
+  <!-- agents: one microVM each, one holds a permit and thinks -->
+  <g stroke-width="1.6">
+    <rect class="g" x="40" y="40" width="110" height="40" rx="8" opacity=".55"/>
+    <circle class="g" cx="58" cy="60" r="5" opacity=".55"/>
+    <line class="g" x1="74" y1="54" x2="128" y2="54" opacity=".4"/>
+    <line class="g" x1="74" y1="66" x2="112" y2="66" opacity=".4"/>
+
+    <rect class="g" x="40" y="96" width="110" height="40" rx="8"/>
+    <circle class="a" cx="58" cy="116" r="5" stroke-width="2"/>
+    <circle class="af" cx="58" cy="116" r="1.8"/>
+    <line class="a" x1="74" y1="110" x2="130" y2="110" stroke-width="2.2"/>
+    <line class="g" x1="74" y1="122" x2="116" y2="122" opacity=".55"/>
+
+    <rect class="g" x="40" y="152" width="110" height="40" rx="8" opacity=".55"/>
+    <circle class="g" cx="58" cy="172" r="5" opacity=".55"/>
+    <line class="g" x1="74" y1="166" x2="124" y2="166" opacity=".4"/>
+    <line class="g" x1="74" y1="178" x2="108" y2="178" opacity=".4"/>
+  </g>
+  <text class="t" x="40" y="228">agents</text>
+  <text class="s" x="40" y="244">one microVM each</text>
+
+  <!-- all traffic leaves through the egress gateway -->
+  <g stroke-width="1.5" opacity=".6">
+    <path class="g" d="M150 60 L 236 60" stroke-dasharray="1 5"/>
+    <path class="a" d="M150 116 L 236 116" stroke-dasharray="1 5"/>
+    <path class="g" d="M150 172 L 236 172" stroke-dasharray="1 5"/>
+  </g>
+  <g stroke-width="1.8">
+    <rect class="g" x="238" y="36" width="24" height="156" rx="5"/>
+    <line class="g" x1="246" y1="60" x2="254" y2="60" opacity=".5"/>
+    <line class="g" x1="246" y1="116" x2="254" y2="116" opacity=".5"/>
+    <line class="g" x1="246" y1="172" x2="254" y2="172" opacity=".5"/>
+  </g>
+  <text class="t" x="222" y="228">gateway</text>
+  <text class="s" x="222" y="244">logs metadata</text>
+
+  <!-- two destinations: the public internet and one API endpoint -->
+  <path class="g" d="M262 56 L 606 56" stroke-width="1.5" opacity=".6"/>
+  <path class="g" d="M598 51 L606 56 L598 61" stroke-width="1.5" opacity=".6"/>
+  <circle class="g" cx="620" cy="56" r="11" stroke-width="1.8"/>
+  <circle class="g" cx="620" cy="56" r="4" stroke-width="1.2" opacity=".5"/>
+  <text class="s" x="640" y="60">internet</text>
+
+  <path class="a" d="M262 116 L 326 116" stroke-width="1.5"/>
+  <path class="a" d="M318 111 L326 116 L318 121" stroke-width="1.5"/>
+  <g stroke-width="1.6">
+    <rect class="g" x="330" y="84" width="190" height="104" rx="10" opacity=".45" stroke-width="1.4"/>
+    <!-- bank -->
+    <rect class="g" x="346" y="98" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="364" y="98" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="382" y="98" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="400" y="98" width="14" height="14" rx="3" opacity=".55"/>
+    <rect class="g" x="418" y="98" width="14" height="14" rx="3"/>
+    <rect class="g" x="436" y="98" width="14" height="14" rx="3"/>
+    <rect class="a" x="454" y="98" width="14" height="14" rx="3" stroke-width="2"/>
+    <!-- board: posts, one of them sealed and paid -->
+    <line class="g" x1="346" y1="136" x2="470" y2="136" opacity=".55" stroke-width="2"/>
+    <line class="a" x1="346" y1="152" x2="440" y2="152" stroke-width="2.4"/>
+    <line class="g" x1="346" y1="168" x2="486" y2="168" opacity=".55" stroke-width="2"/>
+  </g>
+  <text class="s" x="480" y="110" opacity=".55">bank</text>
+  <text class="s" x="480" y="155" opacity=".55">board</text>
+  <text class="t" x="330" y="228">API</text>
+  <text class="s" x="330" y="244">key decides who acts</text>
+
+  <!-- the watcher taps the metadata and can close the gate -->
+  <path class="g" d="M560 60 C 560 96, 600 92, 616 110" stroke-width="1.5" stroke-dasharray="1 5" opacity=".7"/>
+  <g stroke-width="2">
+    <rect class="g" x="590" y="112" width="110" height="70" rx="10" opacity=".6" stroke-width="1.6"/>
+    <line class="g" x1="606" y1="134" x2="676" y2="134" opacity=".7"/>
+    <line class="g" x1="606" y1="148" x2="660" y2="148" opacity=".7"/>
+    <line class="g" x1="606" y1="162" x2="668" y2="162" opacity=".7"/>
+  </g>
+  <path class="a" d="M645 182 C 645 206, 626 206, 600 206 L 288 206 C 262 206, 250 204, 250 198" stroke-width="1.5" stroke-dasharray="1 5" opacity=".9"/>
+  <path class="a" d="M245 204 L250 197 L255 204" stroke-width="1.5"/>
+  <text class="s" x="282" y="202" style="fill:#d39b52" opacity=".9">hold</text>
+  <text class="t" x="590" y="228">watcher</text>
+  <text class="s" x="590" y="244">judges, can hold the cohort</text>
+</svg>

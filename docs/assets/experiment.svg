@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 236" width="760" height="236" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    .g { stroke: #8b949e; }
+    .f { fill: #8b949e; stroke: none; }
+    .a { stroke: #d39b52; }
+    .af { fill: #d39b52; stroke: none; }
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8b949e; }
+    .t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+    .s { font-size: 11.5px; opacity: .8; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  </style>
+
+  <!-- one experiment is one directory -->
+  <rect class="g" x="40" y="36" width="190" height="140" rx="10" opacity=".45" stroke-width="1.4"/>
+  <text class="m" x="56" y="60">run-a/</text>
+  <text class="m" x="70" y="78" opacity=".7">fugue.toml</text>
+  <text class="m" x="70" y="96" opacity=".7">data/</text>
+  <text class="m" x="70" y="114" opacity=".7">agents/kits/</text>
+  <text class="m" x="70" y="132" opacity=".7">agents/homes/</text>
+  <text class="m" x="70" y="150" opacity=".7">evidence/</text>
+  <text class="t" x="40" y="208">experiment</text>
+  <text class="s" x="40" y="224">databases, keys, homes, evidence</text>
+
+  <!-- copy it, change one value -->
+  <path class="g" d="M234 106 L 300 106" stroke-width="1.6" stroke-dasharray="1 5" opacity=".7"/>
+  <path class="g" d="M294 101 L301 106 L294 111" stroke-width="1.6" opacity=".7"/>
+  <text class="s" x="246" y="96" opacity=".7">copy</text>
+
+  <rect class="g" x="306" y="36" width="190" height="140" rx="10" opacity=".45" stroke-width="1.4"/>
+  <text class="m" x="322" y="60">run-b/</text>
+  <text class="m" x="336" y="78" style="fill:#d39b52">fugue.toml</text>
+  <text class="m" x="336" y="96" opacity=".7">data/</text>
+  <text class="m" x="336" y="114" opacity=".7">agents/kits/</text>
+  <text class="m" x="336" y="132" opacity=".7">agents/homes/</text>
+  <text class="m" x="336" y="150" opacity=".7">evidence/</text>
+  <path class="a" d="M418 74 L 430 74" stroke-width="1.4" stroke-dasharray="1 4"/>
+  <text class="s" x="436" y="78" style="fill:#d39b52">one value</text>
+  <text class="t" x="306" y="208">copy</text>
+  <text class="s" x="306" y="224">same state, one value changed</text>
+
+  <!-- run it forward: wakes append to the same files -->
+  <path class="g" d="M500 106 L 552 106" stroke-width="1.6" stroke-dasharray="1 5" opacity=".7"/>
+  <path class="g" d="M546 101 L553 106 L546 111" stroke-width="1.6" opacity=".7"/>
+
+  <g stroke-width="1.6">
+    <line class="g" x1="560" y1="106" x2="700" y2="106" opacity=".4"/>
+    <circle class="g" cx="572" cy="106" r="6" opacity=".55"/>
+    <circle class="g" cx="604" cy="106" r="6" opacity=".55"/>
+    <circle class="g" cx="636" cy="106" r="6" opacity=".55"/>
+    <circle class="a" cx="668" cy="106" r="6" stroke-width="2"/>
+    <circle class="a" cx="700" cy="106" r="6" stroke-dasharray="2 4" opacity=".7"/>
+  </g>
+  <g stroke-width="1.3" opacity=".5">
+    <path class="g" d="M572 112 L 572 134" stroke-dasharray="1 4"/>
+    <path class="g" d="M604 112 L 604 134" stroke-dasharray="1 4"/>
+    <path class="g" d="M636 112 L 636 134" stroke-dasharray="1 4"/>
+    <path class="a" d="M668 112 L 668 134" stroke-dasharray="1 4"/>
+  </g>
+  <g stroke-width="1.6">
+    <rect class="g" x="566" y="138" width="12" height="12" rx="3" opacity=".55"/>
+    <rect class="g" x="598" y="138" width="12" height="12" rx="3" opacity=".55"/>
+    <rect class="g" x="630" y="138" width="12" height="12" rx="3" opacity=".55"/>
+    <rect class="a" x="662" y="138" width="12" height="12" rx="3" stroke-width="2"/>
+  </g>
+  <text class="s" x="560" y="80" opacity=".6">wakes</text>
+  <text class="s" x="560" y="170" opacity=".6">append-only rows</text>
+  <text class="t" x="560" y="208">run forward</text>
+  <text class="s" x="560" y="224">compare the two histories</text>
+</svg>
